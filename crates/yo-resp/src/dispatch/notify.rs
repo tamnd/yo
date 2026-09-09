@@ -71,6 +71,7 @@ use yo_kv::news;
 
 use super::Server;
 use super::pubsub::{self, Kind};
+use super::repl;
 
 /// The class bits, which are Redis's own bit numbers.
 ///
@@ -313,13 +314,18 @@ pub(super) struct Armed {
 pub(super) fn arm(server: &Server, db: usize) -> Armed {
     let flags = server.notify_flags();
     let live = flags & CHANNELS != 0 && server.anyone_subscribed();
+    // A server with a replica wants to hear the same news for a different
+    // reason: a key that goes on its own has to be sent on as a deletion, since
+    // a replica never takes one away by itself. So the hook goes in for either,
+    // and `heard` sorts out which of the two is asking.
+    let copying = repl::arm(server.replicated());
     // Installed for a command that has somewhere to send what it hears and not
     // for one that does not, which is the storage layer's only way of knowing
     // whether the questions it would have to ask to say anything are worth
     // asking. Nothing puts back what was there before, and nothing has to: this
     // runs in front of every command, so the answer is never stale by the time
     // it is read.
-    news::tell(live.then_some(heard as news::Told));
+    news::tell((live || copying).then_some(heard as news::Told));
     Armed {
         flags: ARMED.replace(if live { flags } else { 0 }),
         db: WHERE.replace(db),
@@ -358,10 +364,19 @@ fn heard(key: &[u8], what: news::What, field: &[u8]) {
         news::What::Born => (class::NEW, "new"),
         news::What::Overwritten => (class::OVERWRITTEN, "overwritten"),
         news::What::TypeChanged => (class::TYPE_CHANGED, "type_changed"),
-        news::What::Expired => (class::EXPIRED, "expired"),
-        news::What::FieldExpired => return field_expired(key, field),
+        news::What::Expired => {
+            repl::reaped(&[b"DEL", key]);
+            (class::EXPIRED, "expired")
+        }
+        news::What::FieldExpired => {
+            repl::reaped(&[b"HDEL", key, field]);
+            return field_expired(key, field);
+        }
         news::What::Deleted => (class::GENERIC, "del"),
-        news::What::Evicted => (class::EVICTED, "evicted"),
+        news::What::Evicted => {
+            repl::reaped(&[b"DEL", key]);
+            (class::EVICTED, "evicted")
+        }
         news::What::Missed => (class::KEY_MISS, MISS),
     };
     fire(WHERE.get(), class, name, key);

@@ -46,6 +46,7 @@ use yo_kv::{Db, Entry, Holds};
 
 use super::args::{self, Args};
 use super::notify::{self, class};
+use super::repl;
 use super::table::Spec;
 use crate::reply::Out;
 
@@ -217,6 +218,23 @@ fn xadd(db: &Db, on: usize, args: Args<'_>, now: u64, out: &mut Out) -> Result<(
     match written {
         Some((id, cut)) => {
             id_out(out, id);
+            // The id it made and not the `*` it was asked for, since the whole
+            // point of `*` is that the server picks and two servers picking
+            // would pick differently. The trim goes separately and as a length,
+            // for the reason [`trimmed`] gives.
+            if repl::armed() {
+                let text = id_text(id);
+                let mut parts: Vec<&[u8]> = vec![b"XADD", key, &text];
+                for i in 0..pairs {
+                    let (f, v) = field(i);
+                    parts.push(f);
+                    parts.push(v);
+                }
+                repl::rewrite(&parts);
+                if cut > 0 {
+                    trimmed(db, key);
+                }
+            }
             // The write, and then the trim behind it as a second event when it
             // actually took something. A `MAXLEN` the stream is already under
             // says nothing, and neither does an `XADD` with no trim on it.
@@ -228,9 +246,32 @@ fn xadd(db: &Db, on: usize, args: Args<'_>, now: u64, out: &mut Out) -> Result<(
         // `NOMKSTREAM` on a key that is not there, which is a null and not a
         // zero, so a producer can tell "nobody is consuming this yet" from
         // "the write happened", and nothing was written so nothing is said.
-        None => out.nil(),
+        None => {
+            out.nil();
+            if repl::armed() {
+                repl::nothing();
+            }
+        }
     }
     Ok(())
+}
+
+/// Copy a trim as the exact length it left behind.
+///
+/// Whatever the client asked for, `MAXLEN` and `MINID` and the `~` that lets the
+/// server stop at a node boundary all come to the same thing once it has
+/// happened: this many entries, oldest first, are gone. A replica holding the
+/// same entries in the same order and told to keep the same number of them keeps
+/// exactly the ones this kept, which is true of no other spelling of the
+/// command, `~` least of all.
+fn trimmed(db: &Db, key: &[u8]) {
+    let len = db
+        .hold(key)
+        .stream(key)
+        .ok()
+        .flatten()
+        .map_or(0, Stream::len);
+    repl::rewrite(&[b"XTRIM", key, b"MAXLEN", len.to_string().as_bytes()]);
 }
 
 /// `XTRIM key strategy`.
@@ -248,6 +289,13 @@ fn xtrim(db: &Db, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let gone = stripe.xtrim(key, opts.trim)?;
     drop(stripe);
     out.uint(gone);
+    if repl::armed() {
+        if gone > 0 {
+            trimmed(db, key);
+        } else {
+            repl::nothing();
+        }
+    }
     if gone > 0 {
         notify::fire(on, class::STREAM, "xtrim", key);
     }
@@ -776,6 +824,83 @@ fn unrecognised(name: &str, opt: &[u8]) -> Error {
 
 // ---------------------------------------------------------------- claiming
 
+/// Copy a claim as the claims it turned out to be.
+///
+/// One `XCLAIM` an entry, each naming the delivery time this server settled on
+/// and each with `FORCE` and a minimum idle time of zero, so that the replica
+/// applies it rather than deciding for itself whether the entry was idle enough.
+/// It was idle enough here and that is the decision.
+///
+/// `JUSTID` follows whether this server counted the delivery rather than being
+/// sent always: the replica's count for the entry is this one's count by
+/// induction, so both sides bumping or neither bumping keeps them equal, where
+/// always sending `JUSTID` would leave the replica one behind on every claim.
+///
+/// The entries that were dropped for no longer being in the stream cross as an
+/// `XACK`, which is the command that takes an id off a pending list and is what
+/// the drop amounted to.
+#[allow(clippy::too_many_arguments)]
+fn copy_claims(
+    key: &[u8],
+    group: &[u8],
+    consumer: &[u8],
+    took: &[Id],
+    gone: &[Id],
+    time: u64,
+    bump: bool,
+    retry: Option<u64>,
+    last: Option<Id>,
+) {
+    if !repl::armed() {
+        return;
+    }
+    repl::nothing();
+    let when = time.to_string();
+    let count = retry.map(|n| n.to_string());
+    for (at, &id) in took.iter().enumerate() {
+        let text = id_text(id);
+        let mut parts: Vec<&[u8]> = vec![
+            b"XCLAIM",
+            key,
+            group,
+            consumer,
+            b"0",
+            &text,
+            b"TIME",
+            when.as_bytes(),
+            b"FORCE",
+        ];
+        // A client that named the count is copied as the count, and `JUSTID`
+        // with it so that the replica does not add one to a number that is
+        // already the answer. Without that the two sides disagree about the
+        // entry from here on, which `XPENDING` shows and nothing else does.
+        if let Some(n) = &count {
+            parts.push(b"RETRYCOUNT");
+            parts.push(n.as_bytes());
+            parts.push(b"JUSTID");
+        } else if !bump {
+            parts.push(b"JUSTID");
+        }
+        // The bookmark rides on the last of them, because it moved once here
+        // and moving it once there is the whole of what has to happen.
+        let bookmark;
+        if at + 1 == took.len()
+            && let Some(id) = last
+        {
+            bookmark = id_text(id);
+            parts.push(b"LASTID");
+            parts.push(&bookmark);
+        }
+        repl::rewrite(&parts);
+    }
+    if !gone.is_empty() {
+        let ids: Vec<Vec<u8>> = gone.iter().map(|&id| id_text(id)).collect();
+        let mut parts: Vec<&[u8]> = vec![b"XACK", key, group];
+        parts.extend(ids.iter().map(Vec::as_slice));
+        repl::rewrite(&parts);
+    }
+}
+
 /// `XCLAIM key group consumer min-idle-time id [id ...] [options]`.
 ///
 /// The IDs are read until one does not parse and everything after that is an
@@ -845,11 +970,18 @@ fn claim(db: &Db, on: usize, args: Args<'_>, now: u64, out: &mut Out) -> Result<
             .collect();
         (db.hold(key).xclaim(key, &ids, how, now, &mut gone), gone)
     });
-    gone.clear();
     let Some(took) = took? else {
+        gone.clear();
+        if repl::armed() {
+            repl::nothing();
+        }
         nogroup(out, &kv::no_key_or_group(key, name));
         return Ok(());
     };
+    copy_claims(
+        key, name, who, &took, &gone, how.time, how.bump, how.retry, last,
+    );
+    gone.clear();
     if fresh {
         notify::fire(on, class::STREAM, "xgroup-createconsumer", key);
     }
@@ -907,9 +1039,18 @@ fn autoclaim(db: &Db, on: usize, args: Args<'_>, now: u64, out: &mut Out) -> Res
         )
     });
     let Some((cursor, took)) = claimed? else {
+        if repl::armed() {
+            repl::nothing();
+        }
         nogroup(out, &kv::no_key_or_group(key, name));
         return Ok(());
     };
+    // The same claims one at a time, for the same reason `XCLAIM` sends them
+    // that way, and with no cursor: the sweep chose where to start and where to
+    // stop and neither of those has to be repeated at the other end.
+    copy_claims(
+        key, name, who, &took, &gone, how.time, how.bump, how.retry, None,
+    );
     if fresh {
         notify::fire(on, class::STREAM, "xgroup-createconsumer", key);
     }
@@ -1016,14 +1157,20 @@ fn group(db: &Db, on: usize, args: Args<'_>, now: u64, out: &mut Out) -> Result<
         let read = entries_read(args, 5, n)?;
         let at = start_at(args.get(4))?;
         let key = args.get(2);
-        return match db.hold(key).xgroup_setid(key, args.get(3), at, read)? {
+        // Bound rather than matched on directly, because the stripe a `match`
+        // takes in its scrutinee is still held for the whole of the arms and
+        // `copy_group` below takes it again.
+        let done = db.hold(key).xgroup_setid(key, args.get(3), at, read)?;
+        return match done {
             Some(()) => {
                 out.ok();
                 notify::fire(on, class::STREAM, "xgroup-setid", key);
+                copy_group(db, args);
                 Ok(())
             }
             None => {
                 nogroup(out, &kv::no_group(args.get(3), args.get(2)));
+                repl::nothing();
                 Ok(())
             }
         };
@@ -1037,6 +1184,9 @@ fn group(db: &Db, on: usize, args: Args<'_>, now: u64, out: &mut Out) -> Result<
         // the same shape every removal in every class has.
         if gone {
             notify::fire(on, class::STREAM, "xgroup-destroy", key);
+            copy_verbatim(args);
+        } else {
+            repl::nothing();
         }
         return Ok(());
     }
@@ -1053,11 +1203,15 @@ fn group(db: &Db, on: usize, args: Args<'_>, now: u64, out: &mut Out) -> Result<
                 // that is already there answers zero and says nothing.
                 if made {
                     notify::fire(on, class::STREAM, "xgroup-createconsumer", key);
+                    copy_verbatim(args);
+                } else {
+                    repl::nothing();
                 }
                 Ok(())
             }
             None => {
                 nogroup(out, &kv::no_group(args.get(3), args.get(2)));
+                repl::nothing();
                 Ok(())
             }
         };
@@ -1083,10 +1237,12 @@ fn group(db: &Db, on: usize, args: Args<'_>, now: u64, out: &mut Out) -> Result<
                 if there {
                     notify::fire(on, class::STREAM, "xgroup-delconsumer", key);
                 }
+                copy_verbatim(args);
                 Ok(())
             }
             None => {
                 nogroup(out, &kv::no_group(args.get(3), args.get(2)));
+                repl::nothing();
                 Ok(())
             }
         };
@@ -1121,13 +1277,17 @@ fn create(db: &Db, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     }
     let at = start_at(args.get(4))?;
     let key = args.get(2);
-    if db
+    // Bound rather than asked inline, for the reason `SETID` next door gives:
+    // `copy_group` takes the same stripe again.
+    let made = db
         .hold(key)
-        .xgroup_create(key, args.get(3), at, mkstream, read)?
-    {
+        .xgroup_create(key, args.get(3), at, mkstream, read)?;
+    if made {
         out.ok();
         notify::fire(on, class::STREAM, "xgroup-create", key);
+        copy_group(db, args);
     } else {
+        repl::nothing();
         // Its own prefix, because a client that races another one to create the
         // same group treats this as "somebody else got there" and not as an
         // error to report.
@@ -1161,6 +1321,47 @@ fn start_at(arg: &[u8]) -> Result<Start> {
         return Ok(Start::Last);
     }
     Ok(Start::At(strict_id(arg)?))
+}
+
+/// The subcommand as it arrived.
+///
+/// `XGROUP` carries no write flag, because on a real server the flag is on each
+/// subcommand and there is no subcommand table here yet, so the funnel will not
+/// send the line on its own and each arm that changed something has to say so.
+/// The three that are not `CREATE` or `SETID` have nothing to resolve, so what
+/// they say is the line the client sent.
+fn copy_verbatim(args: Args<'_>) {
+    if !repl::armed() {
+        return;
+    }
+    let parts: Vec<&[u8]> = (0..args.len()).map(|i| args.get(i)).collect();
+    repl::rewrite(&parts);
+}
+
+/// The same `XGROUP` subcommand with the id at position four resolved.
+///
+/// Only one thing about `CREATE` and `SETID` cannot be copied as it arrived,
+/// which is the `$` that means "wherever this stream has got to", and by the
+/// time the group exists the answer is written down in the group itself. So the
+/// bookmark is read back and put in place of whatever was there, and the rest of
+/// the line, whichever order `MKSTREAM` and `ENTRIESREAD` came in, travels
+/// untouched.
+fn copy_group(db: &Db, args: Args<'_>) {
+    if !repl::armed() {
+        return;
+    }
+    let (key, name) = (args.get(2), args.get(3));
+    let last = db
+        .hold(key)
+        .stream(key)
+        .ok()
+        .flatten()
+        .and_then(|s| s.group(name))
+        .map_or(Id::MIN, |g| g.last_id());
+    let text = id_text(last);
+    let mut parts: Vec<&[u8]> = (0..args.len()).map(|i| args.get(i)).collect();
+    parts[4] = &text;
+    repl::rewrite(&parts);
 }
 
 // -------------------------------------------------------------------- info
@@ -1749,7 +1950,45 @@ pub(super) fn read(
     }
     if wrote == 0 {
         out.truncate(mark);
+        // Nothing was read, so there is no group state to move, and the verbatim
+        // form would carry a `BLOCK` that a replica must never honour. A
+        // consumer that was made on the way through has already put its own line
+        // in, and this leaves that one alone: it only settles what happens when
+        // the list is still empty.
+        repl::nothing();
         return Ok(false);
+    }
+    // What a replica has to run to end up with the same group state. Rebuilt
+    // rather than sent verbatim for two reasons: the `BLOCK` has to come off,
+    // since a replica applying the master's stream must never stop to wait, and
+    // a `0` history read has already been resolved to an id here. A plain
+    // `XREAD` never gets this far with a group and never changes anything, so
+    // this is only ever an `XREADGROUP`.
+    if repl::armed()
+        && let Some((group, consumer)) = &r.group
+    {
+        let ids: Vec<Vec<u8>> =
+            r.at.iter()
+                .map(|at| match at {
+                    At::Mine(after) => id_text(*after),
+                    _ => b">".to_vec(),
+                })
+                .collect();
+        let count = r.count.map(|n| n.to_string());
+        let mut parts: Vec<&[u8]> = vec![b"XREADGROUP", b"GROUP", group, consumer];
+        if let Some(n) = &count {
+            parts.push(b"COUNT");
+            parts.push(n.as_bytes());
+        }
+        if r.noack {
+            parts.push(b"NOACK");
+        }
+        parts.push(b"STREAMS");
+        for key in keys {
+            parts.push(key);
+        }
+        parts.extend(ids.iter().map(Vec::as_slice));
+        repl::rewrite(&parts);
     }
     out.close_map(mark, wrote);
     Ok(true)
@@ -1801,7 +2040,7 @@ fn one_stream(
             // In front of the read, because the read is what makes the consumer
             // and its answer says nothing about that. The group is there: the
             // caller checked every key for it before any of them was read.
-            let fresh = notify::armed()
+            let fresh = (notify::armed() || repl::armed())
                 && stripe
                     .stream(key)
                     .ok()
@@ -1824,6 +2063,14 @@ fn one_stream(
                 true
             })?;
             if fresh {
+                // The consumer this read brought into being, which has to cross
+                // even when the read went on to deliver nothing: the replica has
+                // no other way to hear about it, and a consumer that is on one
+                // side and not the other shows up in `XINFO CONSUMERS` and in
+                // every `XAUTOCLAIM` sweep afterwards.
+                if repl::armed() {
+                    repl::rewrite(&[b"XGROUP", b"CREATECONSUMER", key, group, consumer]);
+                }
                 notify::fire(on.at, class::STREAM, "xgroup-createconsumer", key);
             }
             Ok(match n {
@@ -1957,6 +2204,18 @@ fn element(out: &mut Out, e: Entry<'_>) {
         Entry::Int(n) => out.bulk_int(n),
         Entry::Str(s) => out.bulk(s),
     }
+}
+
+/// One ID as the `ms-seq` text a rewrite carries it as.
+///
+/// Allocating, unlike [`id_out`] below, because a rewrite is built out of owned
+/// pieces and is only built at all on a server that has a replica.
+fn id_text(id: Id) -> Vec<u8> {
+    let mut text = Vec::with_capacity(24);
+    yo_common::num::push_u64(&mut text, id.ms);
+    text.push(b'-');
+    yo_common::num::push_u64(&mut text, id.seq);
+    text
 }
 
 /// One ID as the `ms-seq` bulk string every stream reply carries it as.

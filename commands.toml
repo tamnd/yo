@@ -1105,7 +1105,7 @@ plan = "none"
 bounded = "inherent"
 status = "shipped"
 wire = "verified"
-notes = "There is no replication, so the number of replicas that acknowledged this connection's writes is zero and always will be. Redis with no replicas attached gives the same zero, it just takes the whole timeout to do it, and answering at once instead is D-25. It carries the blocking flag because Redis gives it that flag and because that is what a client reads to decide whether it can send this on a pipelined connection, and the flag is what routes it to the file that holds the parking machinery even though it never parks. What is not a formality is the argument checking, since that is the only part of this a client can see today: numreplicas is any integer at all and a negative one is satisfied on the spot, and the timeout is whole milliseconds rather than the seconds BLPOP takes, so it has its own two complaints."
+notes = "How many replicas have acknowledged everything written so far, counted from the offset each one last reported against the offset the master is at. That is a real number now rather than a nought, and a server with no replicas attached still answers nought because the count of nothing is nought. What it does not do is wait: a client asking for more replicas than are level gets the smaller number at once instead of the timeout, which is D-25, and waiting needs a connection to be woken by an acknowledgement arriving rather than by a key changing, which is the same wakeup D-115 is about. It carries the blocking flag because Redis gives it that flag and because that is what a client reads to decide whether it can send this on a pipelined connection, and the flag is what routes it to the file that holds the parking machinery even though it never parks. The argument checking is the reference's: numreplicas is any integer at all and a negative one is satisfied on the spot, and the timeout is whole milliseconds rather than the seconds BLPOP takes, so it has its own two complaints."
 
 [[command]]
 name = "WAITAOF"
@@ -1117,7 +1117,7 @@ plan = "none"
 bounded = "inherent"
 status = "shipped"
 wire = "verified"
-notes = "WAIT for the append only file rather than for replicas, and both of its numbers are zero here for the same reason: appendonly is fixed at no, so there is no local file to be behind, and there is no replication, so there are no remote ones either. The reply is a flat array of two integers on both protocols. Redis reads the three arguments with three different helpers and each has its own complaint, which is worth copying exactly because it is the whole of what a client can see: numlocal is a range and says it must be between 0 and 1, numreplicas must be positive, and the timeout is milliseconds and is refused separately for not being an integer and for being negative. The one error a client can provoke that is about the server rather than the arguments is WAITAOF with numlocal set, which cannot be used when appendonly is disabled, and it is disabled and immutable here."
+notes = "WAIT for the append only file rather than for replicas, and both of its numbers are zero here. The local one is zero because appendonly is fixed at no, so there is no file to be behind, and the remote one is zero because a replica acknowledges bytes received and not bytes written to a file it does not keep either. The reply is a flat array of two integers on both protocols. Redis reads the three arguments with three different helpers and each has its own complaint, which is worth copying exactly because it is the whole of what a client can see: numlocal is a range and says it must be between 0 and 1, numreplicas must be positive, and the timeout is milliseconds and is refused separately for not being an integer and for being negative. The one error a client can provoke that is about the server rather than the arguments is WAITAOF with numlocal set, which cannot be used when appendonly is disabled, and it is disabled and immutable here."
 
 [[command]]
 name = "SCAN"
@@ -5236,6 +5236,41 @@ wire = "verified"
 notes = "An integer, the whole second the last save that worked finished at. A server that has not saved answers the second it started, which is Redis's answer too and is on the grounds that what is in memory came off a file and has not moved. It is the same number rdb_last_save_time reports, so a backup script can poll either. Only a save moves it and a failed save does not. Not admin, so unlike the other three it is reported to a monitor, and not noscript, so a script may call it. Redis tags it nondeterministic_output in COMMAND INFO and yo sends no tips for any command, which is D-13."
 
 [[command]]
+name = "REPLCONF"
+group = "server"
+since = "3.0.0"
+arity = -1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "What a replica tells a master about itself, and nothing else sends it. Everything is a pair and a pair the master does not know is answered OK rather than refused, because the whole point of the command is that a newer replica can tell an older master things it has never heard of, and refusing one of those would end a handshake over a word that did not matter. Two pairs are read. listening-port is the port the replica says it is reachable on, which is what INFO reports as its port rather than the port its outgoing connection dialled from, and capa is read and dropped, since the two capabilities that would change anything are the diskless forms and neither is offered here. ACK is the one that is not a question and is answered with silence: by the time a replica sends one the connection is a stream of commands rather than a client, and a reply written into the middle of that stream is reported at the far end as Protocol error (Master using the inline protocol. Desync?) and drops the link, so the silence is the protocol and not an optimisation. GETACK is what a master sends and a replica answers, so a client that sends it here is told it is only supported by a replica, which is the reference's own sentence. Admin, noscript, loading, stale and allow_busy, all of which are the reference's flags and all of which matter during a handshake with a server that is busy doing something else."
+
+[[command]]
+name = "PSYNC"
+group = "server"
+since = "2.8.0"
+arity = -3
+divergent = "D-139"
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "Where a connection stops being a client. The replica sends the replication id it last had and the byte offset it had reached, or a question mark and minus one when it has nothing to carry on from. A replica asking to carry on with an id this server is still writing under, at an offset the backlog still holds, is answered +CONTINUE and the missing bytes, which costs nothing and is the whole reason a replica bothers to remember where it was. Anything else is a full resync: +FULLRESYNC with this server's id and the offset the snapshot was stamped at, then the snapshot as a bulk string with no trailing newline after it, and from then on the connection carries only the command stream and is never replied to again. Everything the connection was holding as a client goes at that point, which is a transaction it had open, the keys it was watching and any subscription, because all three are promises of a reply and a stream has no way left to keep one. The snapshot has to be one instant of the keyspace or the replica ends up with a change in neither half or in both, so it is taken with every stripe of every database held at once, and that stops the server for as long as it takes, which is D-139."
+
+[[command]]
+name = "SYNC"
+group = "server"
+since = "1.0.0"
+arity = 1
+divergent = "D-139"
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "PSYNC from before there was anything to negotiate. No arguments, no header line and no way to carry on from anywhere: the snapshot goes straight down the socket and the command stream follows it. It is here because it is what an old replica and several tools speak, and it shares every line of the resync with PSYNC, so it carries the same divergence for the same reason. A connection that sends it is a stream afterwards in exactly the same way."
+
+[[command]]
 name = "ROLE"
 group = "server"
 since = "2.8.12"
@@ -5244,7 +5279,7 @@ plan = "none"
 bounded = "inherent"
 status = "shipped"
 wire = "verified"
-notes = "Three elements: the word master, then the replication offset as an integer, then the list of replicas attached. Zero and an empty list, which is the same pair INFO replication reports next to it and is true rather than a placeholder: nothing has been written to a stream that does not exist and nothing is following this server. It becomes a real answer when replication lands. Noscript, so a script is refused it, which is a real server too and is the one thing about this command that surprises people. Not admin, so it is reported to a monitor."
+notes = "Three elements: the word master, then the replication offset as an integer, then the list of replicas attached, each of them a triple of address, port and the offset it last acknowledged. Every field inside a replica row is a bulk string including the two numbers, which is a shape nobody would pick today and is the shape every client library already parses. Only the replicas that are online are listed, because one still being sent its snapshot has no offset of its own to report and the reference leaves it out for the same reason. A server with nothing following it answers nought and an empty list, which is the same pair INFO replication reports next to it and is true rather than a placeholder. Noscript, so a script is refused it, which is a real server too and is the one thing about this command that surprises people. Not admin, so it is reported to a monitor."
 
 [[command]]
 name = "DEBUG"

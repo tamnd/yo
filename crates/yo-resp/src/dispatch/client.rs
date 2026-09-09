@@ -629,6 +629,7 @@ impl core::fmt::Display for Flags {
             // writes them in, so a monitor that has also subscribed reads `OP`
             // and never `PO`.
             (clients::MONITOR, 'O'),
+            (clients::REPLICA, 'S'),
             (clients::SUBSCRIBED, 'P'),
             (clients::IN_MULTI, 'x'),
             (clients::UNIX, 'U'),

@@ -498,6 +498,22 @@ pub(super) const fn popped(end: End) -> &'static str {
     }
 }
 
+/// The keyword that names an end, as `LMOVE` and `LMOVEM` spell it.
+pub(super) const fn word(end: End) -> &'static [u8] {
+    match end {
+        End::Left => b"LEFT",
+        End::Right => b"RIGHT",
+    }
+}
+
+/// And the keyword that names an ordering, which only `LMOVEM` takes.
+pub(super) const fn order_word(order: Order) -> &'static [u8] {
+    match order {
+        Order::OneByOne => b"OBO",
+        Order::Bulk => b"BULK",
+    }
+}
+
 /// Which end the four push names mean, read off the letter in front.
 ///
 /// `LPUSH` and `LPUSHX` are the same end and so are the two on the right, so the

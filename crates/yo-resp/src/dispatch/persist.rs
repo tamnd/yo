@@ -165,7 +165,7 @@ pub(super) fn execute(
         }
         "bgrewriteaof" => rewrite(server, session, out),
         "lastsave" => out.int(server.last_save()),
-        "role" => role(out),
+        "role" => super::repl::role(server, out),
         _ => return Err(args::unknown_command(args)),
     }
     Ok(())
@@ -223,20 +223,6 @@ fn rewrite(server: &Server, session: &Session, out: &mut Out) {
     } else {
         out.simple(b"Background append only file rewriting started");
     }
-}
-
-/// `ROLE`, which is what a client asks before it trusts anything else it reads.
-///
-/// Three elements: the word, then a number whose meaning depends on the word,
-/// then a list whose shape depends on it too. A master answers its replication
-/// offset and the replicas attached to it, and this server is a master with no
-/// replicas and nothing written to a stream that does not exist yet, which is
-/// the same zero `INFO replication` reports next to it.
-fn role(out: &mut Out) {
-    out.array(3);
-    out.bulk(b"master");
-    out.int(0);
-    out.array(0);
 }
 
 /// Write the whole dataset out, and say whether it worked.
@@ -305,7 +291,7 @@ pub(super) fn skipped(server: &Server) -> usize {
 /// and buying one here would mean holding every stripe of every database at once
 /// while megabytes are written, which would stop the server for as long as the
 /// save takes. The same trade [`super::backup`] makes and the same reason.
-fn build(server: &Server) -> (Vec<u8>, usize) {
+pub(super) fn build(server: &Server) -> (Vec<u8>, usize) {
     let bits: &[u8] = if usize::BITS == 64 { b"64" } else { b"32" };
     let mut snap = Snapshot::new();
     snap.aux(b"redis-ver", REPORTED_VERSION.as_bytes());

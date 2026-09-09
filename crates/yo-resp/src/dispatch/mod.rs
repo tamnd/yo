@@ -85,6 +85,7 @@ mod multi;
 mod notify;
 mod persist;
 mod pubsub;
+mod repl;
 mod scan;
 mod scripting;
 mod search;
@@ -881,6 +882,12 @@ pub struct Server {
     /// the command being reported is running on a thread that cannot reach the
     /// connection being told about it. See the `monitor` module.
     monitors: monitor::Monitors,
+    /// Being a master: the identity, the stream and whoever is being fed it.
+    ///
+    /// Here for the fourth time and for the fourth version of the same reason:
+    /// the write being copied is running on a thread that cannot reach the
+    /// connection it has to be copied to. See the `repl` module.
+    repl: repl::Replication,
     /// What the saves have done, which is all `INFO persistence` has to report.
     persist: persist::Persistence,
     /// Who is allowed to run what, which is also where `requirepass` lives.
@@ -947,6 +954,7 @@ impl Server {
             kills: AtomicUsize::new(0),
             pause: AtomicU64::new(0),
             monitors: monitor::Monitors::default(),
+            repl: repl::Replication::default(),
             persist: persist::Persistence::default(),
             acl: acl::Users::default(),
             acllog: acl::Log::default(),
@@ -1031,6 +1039,7 @@ impl Server {
             kills: AtomicUsize::new(0),
             pause: AtomicU64::new(0),
             monitors: monitor::Monitors::default(),
+            repl: repl::Replication::default(),
             persist: persist::Persistence::default(),
             acl: acl::Users::default(),
             acllog: acl::Log::default(),
@@ -1902,6 +1911,10 @@ impl Server {
             let fields = slot.field_expire_cycle(left);
             drop(slot);
             notify::drain(self, armed);
+            // The same deletions a lookup's would be, from the other end of the
+            // same hook. A replica hears about a key the sweep took exactly as
+            // it hears about one a `GET` took.
+            repl::swept(self, self.slot_db(i));
             spent += c.examined + fields;
             if c.expired > 0 {
                 self.expire_db.store((i + 1) % slots, Relaxed);
@@ -2382,6 +2395,16 @@ impl Session {
         self.sock.flag(clients::MONITOR)
     }
 
+    /// Whether this connection has sent `PSYNC` and stopped being a client.
+    ///
+    /// Off the row for the same reason the question above it is, and read on the
+    /// way out rather than on the way in: a replica does keep sending commands,
+    /// `REPLCONF ACK` once a second forever, and what changes is that none of
+    /// them is answered.
+    pub(crate) fn replicating(&self) -> bool {
+        self.sock.flag(clients::REPLICA)
+    }
+
     /// Say which connection slot this session is in.
     ///
     /// Called by the front when it opens the connection, which is the only place
@@ -2489,6 +2512,9 @@ pub fn forget_session(server: &Server, session: &mut Session) {
     pubsub::release(server, session);
     if session.monitoring() {
         server.watch_no_more(session.row());
+    }
+    if session.replicating() {
+        server.drop_replica(session.row().id);
     }
 }
 
@@ -2747,6 +2773,17 @@ pub fn resolved(
         return Flow::Hold;
     }
 
+    // And the same thing for the moment a full resync is taking its image. A
+    // write held here runs a moment later against a keyspace it has not missed
+    // anything of, which is the whole reason it is held: the image and the
+    // offset stamped with it have to be the two halves of one instant, and a
+    // write that landed between them would be in both or in neither. Only the
+    // writes, and never a command `EXEC` is replaying, for the same reasons the
+    // pause above gives.
+    if !session.running && server.frozen() && may_replicate(spec, session) {
+        return Flow::Hold;
+    }
+
     // Held rather than run, and the reply is `QUEUED`. After the refusals above
     // and before everything below, which is where a real server puts it: a
     // command has to be a real command with the right number of arguments to be
@@ -2794,6 +2831,15 @@ pub fn resolved(
     // below are handed a database and their arguments and have no way to reach
     // the pub/sub registry from there. Off costs one thread local store.
     let armed = notify::arm(server, session.db);
+    // And whether what it does has to reach a replica as well, which the bodies
+    // ask about for the same reason and get an answer by the same route. That
+    // arming is done by `notify::arm` above, since the two listeners hear about
+    // an expired key through the same hook and only one of them can install it.
+    // What is left here is whether the command as the client sent it would be a
+    // fair thing to hand a replica, which is the write flag and nothing else: a
+    // read sends only what its body pushed, which is normally nothing.
+    let copying = server.replicated();
+    let verbatim = spec.flags.contains(&"write");
     // Which of the keys this command reads are not there. A real server says
     // this from inside each lookup and this says all of them in front, which is
     // the same order for every command whose first act is to read what it was
@@ -3028,6 +3074,30 @@ pub fn resolved(
     }
     notify::drain(server, armed);
 
+    // And copy it to the replicas. Only the writes, because a read changes
+    // nothing there is anything to copy, and only the ones that got through,
+    // because a command that was refused on its own arguments would be refused
+    // there too and sending it would be asking a second server to make the same
+    // mistake. `EVAL` and `EXEC` are not writes and are not sent: what they did
+    // came through here one command at a time and each of those was sent on its
+    // own, which is effect replication and is what a real server settled on for
+    // the same reason.
+    //
+    // On the database the command ran on rather than the one the session is on
+    // now, which are the same thing for everything but `SELECT`, and `SELECT` is
+    // not a write.
+    // Whatever went away on its own goes first, ahead of the command's own
+    // effect and whether or not the command has one. A read that reaped a key on
+    // the way past has a deletion to send and nothing else.
+    repl::swept(server, session.db);
+    if copying {
+        if done.is_ok() {
+            repl::feed(server, session.db, args, verbatim);
+        } else {
+            repl::forget();
+        }
+    }
+
     let flow = match done {
         Ok(flow) => flow,
         Err(e) => {
@@ -3110,6 +3180,8 @@ mod tests {
         session: Session,
         argv: Argv,
         out: Out,
+        /// How far into the replication stream [`Fixture::crossed`] has read.
+        mark: u64,
     }
 
     /// The number out of an integer reply, for a test that compares two of them
@@ -3139,7 +3211,32 @@ mod tests {
                 session: Session::new(7),
                 argv: Argv::new(),
                 out: Out::new(Proto::Resp2),
+                mark: 0,
             }
+        }
+
+        /// The same, on a server that believes it has a replica.
+        ///
+        /// Nothing is attached to it. What the tests below read is the
+        /// replication stream itself, which is written whether or not there is
+        /// anybody to send it to, so a server told this is a master in every
+        /// way that these tests can see.
+        fn replicated() -> Fixture {
+            let f = Fixture::new();
+            f.server.pretend_replica();
+            f
+        }
+
+        /// Run one command and answer with what crossed to a replica.
+        ///
+        /// Only what this command added, so a test reads one line rather than
+        /// the whole history, and the `SELECT` the stream opens with is part of
+        /// the first answer for the same reason it is part of the stream.
+        fn crossed(&mut self, parts: &[&[u8]]) -> String {
+            self.run(parts);
+            let (text, upto) = self.server.stream_since(self.mark);
+            self.mark = upto;
+            text
         }
 
         /// Run one command and answer with the bytes it wrote.
@@ -31294,5 +31391,312 @@ mod tests {
         // And not the ones that are not, since a client reads this to find out
         // what it can send.
         assert!(!reply.contains("TRACKING"), "{reply}");
+    }
+
+    // ------------------------------------------------- what crosses to a replica
+
+    /// The stream, split back into the commands it is made of.
+    ///
+    /// A replica reads this with the same parser it reads a client with, so a
+    /// test can read it the same way, and a list of words is what the rewrite
+    /// table in the spec is written in.
+    fn commands(stream: &str) -> Vec<Vec<String>> {
+        let mut out = Vec::new();
+        let mut rest = stream;
+        while let Some(tail) = rest.strip_prefix('*') {
+            let (n, tail) = tail.split_once("\r\n").expect("a header ends");
+            let mut one = Vec::new();
+            let mut tail = tail;
+            for _ in 0..n.parse::<usize>().expect("a count") {
+                let body = tail.strip_prefix('$').expect("a bulk string");
+                let (len, body) = body.split_once("\r\n").expect("a length ends");
+                let len: usize = len.parse().expect("a length");
+                one.push(body[..len].to_string());
+                tail = &body[len + 2..];
+            }
+            out.push(one);
+            rest = tail;
+        }
+        assert!(rest.is_empty(), "left over: {rest:?}");
+        out
+    }
+
+    /// The words of the one command a test expects to have crossed.
+    fn only(stream: &str) -> Vec<String> {
+        let mut each = commands(stream);
+        assert_eq!(each.len(), 1, "expected one command: {stream:?}");
+        each.pop().expect("one command")
+    }
+
+    #[test]
+    fn the_stream_opens_with_a_select_and_says_it_once() {
+        let mut f = Fixture::replicated();
+        assert_eq!(
+            commands(&f.crossed(&[b"SET", b"k", b"v"])),
+            vec![
+                vec!["SELECT".to_string(), "0".to_string()],
+                vec!["SET".to_string(), "k".to_string(), "v".to_string()],
+            ]
+        );
+        // The second write is on the same database, so it goes on its own.
+        assert_eq!(only(&f.crossed(&[b"SET", b"k2", b"v"])), ["SET", "k2", "v"]);
+        // A different one says so first, and the SELECT is not the client's,
+        // which crossed nothing on its own.
+        f.run(&[b"SELECT", b"3"]);
+        assert_eq!(
+            commands(&f.crossed(&[b"SET", b"k3", b"v"])),
+            vec![
+                vec!["SELECT".to_string(), "3".to_string()],
+                vec!["SET".to_string(), "k3".to_string(), "v".to_string()],
+            ]
+        );
+    }
+
+    /// The deadline is read back off the key rather than worked out twice.
+    ///
+    /// So what crosses is the instant this server picked, and a replica that
+    /// applies it an hour later still expires the key at the same moment.
+    #[test]
+    fn a_relative_deadline_crosses_as_the_instant_it_resolved_to() {
+        let mut f = Fixture::replicated();
+        f.crossed(&[b"SET", b"seed", b"1"]);
+        for parts in [
+            &[b"SET".as_slice(), b"k", b"v", b"EX", b"100"][..],
+            &[b"SETEX".as_slice(), b"k", b"100", b"v"][..],
+        ] {
+            let words = only(&f.crossed(parts));
+            assert_eq!(&words[..3], ["SET", "k", "v"], "{words:?}");
+            assert_eq!(words[3], "PXAT", "{words:?}");
+            let at: i64 = words[4].parse().expect("an instant");
+            assert!(at > f.server.clock.now_ms() as i64, "{words:?}");
+        }
+        for parts in [
+            &[b"EXPIRE".as_slice(), b"k", b"50"][..],
+            &[b"PEXPIRE".as_slice(), b"k", b"50000"][..],
+            &[b"EXPIREAT".as_slice(), b"k", b"99999999999"][..],
+            &[b"GETEX".as_slice(), b"k", b"EX", b"100"][..],
+        ] {
+            let words = only(&f.crossed(parts));
+            assert_eq!(&words[..2], ["PEXPIREAT", "k"], "{words:?}");
+        }
+        assert_eq!(
+            only(&f.crossed(&[b"GETEX", b"k", b"PERSIST"])),
+            ["PERSIST", "k"]
+        );
+    }
+
+    /// A read sends nothing, and neither does a write that was refused.
+    #[test]
+    fn nothing_crosses_for_a_read_or_for_a_failure() {
+        let mut f = Fixture::replicated();
+        f.crossed(&[b"SET", b"k", b"v"]);
+        for parts in [
+            &[b"GET".as_slice(), b"k"][..],
+            &[b"TYPE".as_slice(), b"k"][..],
+            &[b"STRLEN".as_slice(), b"k"][..],
+            &[b"EXISTS".as_slice(), b"k"][..],
+            &[b"PING".as_slice()][..],
+            // Refused, and a refusal leaves the stream alone whatever the body
+            // pushed before it found out.
+            &[b"LPUSH".as_slice(), b"k", b"a"][..],
+            &[b"INCR".as_slice(), b"k"][..],
+        ] {
+            assert_eq!(f.crossed(parts), "", "{parts:?}");
+        }
+    }
+
+    /// A write that changed nothing still crosses, which is D-140.
+    ///
+    /// Redis decides with a counter of real changes and sends nothing when it
+    /// did not move. There is no such counter here yet, so what is sent is what
+    /// can be said without one: an accepted write goes down the link. The ones
+    /// whose verbatim form would be wrong rather than merely wasteful already
+    /// say so for themselves, which is the second half of this.
+    #[test]
+    fn a_write_that_changed_nothing_still_crosses() {
+        let mut f = Fixture::replicated();
+        f.crossed(&[b"SET", b"k", b"v"]);
+        assert_eq!(
+            only(&f.crossed(&[b"DEL", b"nosuchkey"])),
+            ["DEL", "nosuchkey"]
+        );
+        assert_eq!(only(&f.crossed(&[b"SET", b"k", b"v"])), ["SET", "k", "v"]);
+        // And the ones that would be wrong say nothing, whatever the rule above.
+        for parts in [
+            &[b"SPOP".as_slice(), b"nosuchset"][..],
+            &[b"EXPIRE".as_slice(), b"nosuchkey", b"100"][..],
+            &[
+                b"XADD".as_slice(),
+                b"nosuchstream",
+                b"NOMKSTREAM",
+                b"*",
+                b"f",
+                b"v",
+            ][..],
+        ] {
+            assert_eq!(f.crossed(parts), "", "{parts:?}");
+        }
+    }
+
+    /// A conditional write crosses as the plain one, since the condition was
+    /// decided here and a replica has no business deciding it again.
+    #[test]
+    fn a_condition_that_held_crosses_without_it() {
+        let mut f = Fixture::replicated();
+        f.crossed(&[b"SET", b"seed", b"1"]);
+        assert_eq!(only(&f.crossed(&[b"SETNX", b"k", b"v"])), ["SET", "k", "v"]);
+        assert_eq!(
+            only(&f.crossed(&[b"SET", b"k", b"w", b"XX"])),
+            ["SET", "k", "w"]
+        );
+    }
+
+    /// A write whose result depends on where it ran crosses as the result.
+    #[test]
+    fn a_random_or_derived_write_crosses_as_what_it_did() {
+        let mut f = Fixture::replicated();
+        f.crossed(&[b"SET", b"seed", b"1"]);
+        f.crossed(&[b"SADD", b"s", b"one", b"two"]);
+        let words = only(&f.crossed(&[b"SPOP", b"s"]));
+        assert_eq!(&words[..2], ["SREM", "s"], "{words:?}");
+        assert!(words[2] == "one" || words[2] == "two", "{words:?}");
+        // The one that took the last member crosses as the key going, since
+        // that is what happened and a set with nothing in it does not exist.
+        assert_eq!(only(&f.crossed(&[b"SPOP", b"s"])), ["DEL", "s"]);
+        f.crossed(&[b"SET", b"n", b"1"]);
+        assert_eq!(
+            only(&f.crossed(&[b"INCRBYFLOAT", b"n", b"1.5"])),
+            ["SET", "n", "2.5", "KEEPTTL"]
+        );
+        assert_eq!(only(&f.crossed(&[b"GETDEL", b"n"])), ["DEL", "n"]);
+        let words = only(&f.crossed(&[b"XADD", b"st", b"*", b"f", b"v"]));
+        assert_eq!(&words[..2], ["XADD", "st"], "{words:?}");
+        assert_ne!(words[2], "*", "an auto id has to be resolved: {words:?}");
+        assert_eq!(&words[3..], ["f", "v"], "{words:?}");
+    }
+
+    /// A key that went on its own crosses as the deletion, ahead of whatever the
+    /// command that noticed was doing.
+    ///
+    /// A replica never expires anything itself, so this is the only way it hears
+    /// about it, and the order matters: the write that follows would be refused
+    /// by a replica still holding the old key at the old type.
+    #[test]
+    fn an_expiry_a_read_noticed_crosses_as_a_deletion() {
+        let mut f = Fixture::replicated();
+        f.crossed(&[b"SET", b"k", b"v", b"PX", b"50"]);
+        f.advance(100);
+        assert_eq!(only(&f.crossed(&[b"GET", b"k"])), ["DEL", "k"]);
+        // And the deletion goes first when the command had something of its own.
+        f.run(&[b"SET", b"k2", b"v", b"PX", b"50"]);
+        f.crossed(&[b"PING"]);
+        f.advance(100);
+        assert_eq!(
+            commands(&f.crossed(&[b"LPUSH", b"k2", b"a"])),
+            vec![
+                vec!["DEL".to_string(), "k2".to_string()],
+                vec!["LPUSH".to_string(), "k2".to_string(), "a".to_string()],
+            ]
+        );
+    }
+
+    /// A command that parked has done nothing, so nothing crosses.
+    ///
+    /// What must never cross is the command as it arrived, since a replica told
+    /// to `BLPOP` would stop and wait on the one connection that cannot stop.
+    #[test]
+    fn a_blocking_command_that_parked_crosses_nothing() {
+        let mut f = Fixture::replicated();
+        f.crossed(&[b"SET", b"seed", b"1"]);
+        assert_eq!(f.flow(&[b"BLPOP", b"gone", b"0"]).0, Flow::Block);
+        assert_eq!(f.server.stream_since(f.mark).0, "");
+        f.run(&[b"XADD", b"st", b"1-1", b"f", b"v"]);
+        f.run(&[b"XGROUP", b"CREATE", b"st", b"g", b"$"]);
+        f.crossed(&[b"PING"]);
+        // A group read that read nothing is in the same position, and this one
+        // does not even park.
+        f.run(&[
+            b"XREADGROUP",
+            b"GROUP",
+            b"g",
+            b"c",
+            b"COUNT",
+            b"1",
+            b"STREAMS",
+            b"st",
+            b">",
+        ]);
+        assert_eq!(
+            only(&f.crossed(&[b"PING"])),
+            ["XGROUP", "CREATECONSUMER", "st", "g", "c"]
+        );
+    }
+
+    /// `XGROUP` carries its write flag on its subcommands, which are not in the
+    /// table yet, so each arm says for itself what it did.
+    #[test]
+    fn every_xgroup_subcommand_that_changed_something_crosses() {
+        let mut f = Fixture::replicated();
+        f.crossed(&[b"XADD", b"st", b"1-1", b"f", b"v"]);
+        // The dollar is resolved here, because by the time a replica reads it
+        // the stream it means is a different length.
+        assert_eq!(
+            only(&f.crossed(&[b"XGROUP", b"CREATE", b"st", b"g", b"$"])),
+            ["XGROUP", "CREATE", "st", "g", "1-1"]
+        );
+        assert_eq!(
+            only(&f.crossed(&[b"XGROUP", b"CREATECONSUMER", b"st", b"g", b"c"])),
+            ["XGROUP", "CREATECONSUMER", "st", "g", "c"]
+        );
+        assert_eq!(
+            only(&f.crossed(&[b"XGROUP", b"SETID", b"st", b"g", b"0"])),
+            ["XGROUP", "SETID", "st", "g", "0-0"]
+        );
+        assert_eq!(
+            only(&f.crossed(&[b"XGROUP", b"DELCONSUMER", b"st", b"g", b"c"])),
+            ["XGROUP", "DELCONSUMER", "st", "g", "c"]
+        );
+        assert_eq!(
+            only(&f.crossed(&[b"XGROUP", b"DESTROY", b"st", b"g"])),
+            ["XGROUP", "DESTROY", "st", "g"]
+        );
+        // And one that changed nothing crosses nothing.
+        assert_eq!(f.crossed(&[b"XGROUP", b"DESTROY", b"st", b"g"]), "");
+    }
+
+    /// A publish crosses even though it is not a write and touches no key.
+    ///
+    /// A client subscribed to a replica is subscribed to the whole server, so
+    /// it has to hear what was published on the master.
+    #[test]
+    fn a_publish_crosses_with_nobody_listening() {
+        let mut f = Fixture::replicated();
+        f.crossed(&[b"SET", b"seed", b"1"]);
+        assert_eq!(
+            only(&f.crossed(&[b"PUBLISH", b"news", b"hello"])),
+            ["PUBLISH", "news", "hello"]
+        );
+        assert_eq!(
+            only(&f.crossed(&[b"SPUBLISH", b"news", b"hello"])),
+            ["SPUBLISH", "news", "hello"]
+        );
+    }
+
+    /// A transaction crosses as the commands it ran, which is D-141: a real
+    /// server wraps them in `MULTI` and `EXEC`.
+    #[test]
+    fn a_transaction_crosses_as_its_commands() {
+        let mut f = Fixture::replicated();
+        f.crossed(&[b"SET", b"seed", b"1"]);
+        f.run(&[b"MULTI"]);
+        f.run(&[b"SET", b"a", b"1"]);
+        f.run(&[b"INCR", b"a"]);
+        assert_eq!(
+            commands(&f.crossed(&[b"EXEC"])),
+            vec![
+                vec!["SET".to_string(), "a".to_string(), "1".to_string()],
+                vec!["INCR".to_string(), "a".to_string()],
+            ]
+        );
     }
 }

@@ -320,6 +320,8 @@ pub(super) fn execute(
         "auth" => auth::execute(server, session, args, out)?,
         "debug" => debug::execute(server, session, args, out)?,
         "memory" => super::memory::execute(server, session, args, out)?,
+        "replconf" => super::repl::replconf(server, session, args, out)?,
+        "psync" | "sync" => super::repl::psync(server, session, args, out)?,
         "hello" => hello(server, session, args, out)?,
         "select" => {
             let n = args.int(1)?;
@@ -1601,17 +1603,7 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
             }
         }
         if want("replication") {
-            // Four fields out of Redis's dozen, and the eight that are missing
-            // all describe the replication backlog, which is a thing that does
-            // not exist here rather than a thing that is empty. The four that
-            // are here are true of a server with no replica attached: it is the
-            // master, nobody is following it, no failover is in progress and
-            // nothing has been written to a stream that does not exist, which is
-            // an offset of zero.
-            s.push_str(
-                "# Replication\r\nrole:master\r\nconnected_slaves:0\r\n\
-                 master_failover_state:no-failover\r\nmaster_repl_offset:0\r\n\r\n",
-            );
+            super::repl::info(server, &mut s);
         }
         if extra("commandstats") {
             s.push_str("# Commandstats\r\n");

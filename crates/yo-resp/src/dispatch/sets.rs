@@ -29,6 +29,7 @@ use yo_kv::{Db, Member};
 
 use super::args::{self, Args};
 use super::notify::{self, class};
+use super::repl;
 use super::scan;
 use super::table::Spec;
 use crate::reply::Out;
@@ -125,14 +126,19 @@ pub(super) fn execute(
                 // is written after the fact from the count that came back.
                 let start = out.len();
                 let mut got = false;
+                let mut drawn = Vec::new();
                 db.hold(key).spop_into(key, 1, |m| {
                     write_member(out, m);
+                    if repl::armed() {
+                        drawn.push(member_bytes(m));
+                    }
                     got = true;
                 })?;
                 if !got {
                     out.nil();
                 }
                 debug_assert!(out.len() > start, "a reply went out either way");
+                popped(db, key, &drawn);
                 if got {
                     notify::fire(on, class::SET, "spop", key);
                     notify::emptied(db, on, key);
@@ -142,11 +148,16 @@ pub(super) fn execute(
                 let want = pop_count(args.get(2))?;
                 let start = out.len();
                 let mut n = 0;
+                let mut drawn = Vec::new();
                 db.hold(key).spop_into(key, want, |m| {
                     write_member(out, m);
+                    if repl::armed() {
+                        drawn.push(member_bytes(m));
+                    }
                     n += 1;
                 })?;
                 out.close_set(start, n);
+                popped(db, key, &drawn);
                 // A set that is there is never empty, so nothing drawn means
                 // either a missing key or a count of zero, and neither of those
                 // says anything. A count that took the whole set says `spop`
@@ -398,6 +409,41 @@ fn write_member(out: &mut Out, m: Member<'_>) {
         Member::Int(n) => out.bulk_int(n),
         Member::Str(s) => out.bulk(s),
     }
+}
+
+/// One member as the bytes a rewrite carries, which is the same text the reply
+/// would have carried.
+fn member_bytes(m: Member<'_>) -> Vec<u8> {
+    match m {
+        Member::Int(n) => n.to_string().into_bytes(),
+        Member::Str(s) => s.to_vec(),
+    }
+}
+
+/// Copy a draw as the removal it amounts to.
+///
+/// `SPOP` picks its members here, so sending it on would have the replica pick
+/// its own and the two sets would part company on the first call. What crosses
+/// is the members that were actually taken, or the delete when they were all of
+/// them, which is what a real master sends and is a good deal shorter than
+/// naming a whole set one member at a time.
+fn popped(db: &Db, key: &[u8], drawn: &[Vec<u8>]) {
+    if !repl::armed() {
+        return;
+    }
+    if drawn.is_empty() {
+        repl::nothing();
+        return;
+    }
+    if !db.hold(key).exists(key) {
+        repl::rewrite(&[b"DEL", key]);
+        return;
+    }
+    let mut parts: Vec<&[u8]> = Vec::with_capacity(drawn.len() + 2);
+    parts.push(b"SREM");
+    parts.push(key);
+    parts.extend(drawn.iter().map(Vec::as_slice));
+    repl::rewrite(&parts);
 }
 
 /// A count as the integer the reply carries.
