@@ -543,6 +543,65 @@ impl Server {
         (image, offset)
     }
 
+    /// Take a master's history as our own, which is what a replica does.
+    ///
+    /// Everything this server writes from here on is under the master's id and
+    /// at the master's offsets, so a sub-replica underneath is handed positions
+    /// its own master would recognise. The backlog goes with it, because what is
+    /// in it is a stretch of a history this server is no longer writing and
+    /// answering a partial resync out of it would send a replica bytes from
+    /// somebody else's stream.
+    pub(crate) fn adopt(&self, id: [u8; ID_LEN], offset: u64) {
+        let mut ours = self.repl.id.lock();
+        if *ours == id && self.repl.offset.load(Acquire) == offset {
+            return;
+        }
+        *ours = id;
+        drop(ours);
+        let mut backlog = self.repl.backlog.lock();
+        *backlog = Backlog::default();
+        self.repl.offset.store(offset, Release);
+        drop(backlog);
+        self.repl.on_db.store(-1, Relaxed);
+    }
+
+    /// Stop following and start a history of our own, keeping the old one.
+    ///
+    /// The id this server was writing under becomes the second id and the offset
+    /// it had reached becomes the second offset, and a new id is taken. That is
+    /// what lets the replicas that were following the same master be handed over
+    /// to this one without every one of them starting from a snapshot: each of
+    /// them asks about a history this server can still say it was part of, up to
+    /// the point where the two part, and the second offset is that point.
+    pub(crate) fn promote(&self) {
+        let mut id = self.repl.id.lock();
+        let mut id2 = self.repl.id2.lock();
+        *id2 = *id;
+        *id = make_id();
+        // One past the last byte of the old history, which is the first byte
+        // that is only ours, because a replica asks about the first byte it
+        // wants and counts from one.
+        self.repl
+            .second
+            .store(self.repl.offset.load(Acquire) as i64 + 1, Relaxed);
+    }
+
+    /// Take a fresh replication id and forget the old one, which is what
+    /// `DEBUG CHANGE-REPL-ID` is for.
+    ///
+    /// Not a promotion. A promotion keeps the old id as the second one so that
+    /// the replicas that shared it can carry on, and this throws it away, which
+    /// is the point: it is how a test makes two servers that were part of the
+    /// same history stop being able to prove it, so the next `PSYNC` between
+    /// them has to be a full one.
+    pub(crate) fn change_id(&self) {
+        let mut id = self.repl.id.lock();
+        let mut id2 = self.repl.id2.lock();
+        *id = make_id();
+        *id2 = [b'0'; ID_LEN];
+        self.repl.second.store(-1, Relaxed);
+    }
+
     /// The replica row for a connection, if it is one.
     fn replica_of(&self, id: u64) -> Option<Arc<Replica>> {
         let rows = self.repl.rows.lock();
@@ -609,6 +668,23 @@ fn send(server: &Server, db: usize, parts: &[&[u8]]) {
     emit(server, bytes);
 }
 
+/// Pass a master's bytes on, unchanged, and count them.
+///
+/// What a replica owes anybody following it is the stream it was given rather
+/// than an account of what running it did, because the offsets in that stream
+/// are positions in the master's history and this server is not writing one. So
+/// the bytes go on as they arrived. The count moves either way, because it is
+/// the number this server acknowledges to its own master and a chain of nobody
+/// still has to be able to say where it has got to.
+pub(crate) fn relayed(server: &Server, bytes: Vec<u8>, db: usize) {
+    if server.replicated() {
+        server.repl.on_db.store(db as i64, Relaxed);
+        emit(server, bytes);
+        return;
+    }
+    server.repl.offset.fetch_add(bytes.len() as u64, Release);
+}
+
 /// Report a command to every replica, in the form it has to be given.
 ///
 /// The caller has already checked [`Server::replicated`] and that the command
@@ -619,6 +695,10 @@ fn send(server: &Server, db: usize, parts: &[&[u8]]) {
 /// which sends nothing, and for a container like `XGROUP` whose flags are on its
 /// subcommands, which sends what its body pushed and nothing otherwise.
 pub(super) fn feed(server: &Server, db: usize, args: Args<'_>, verbatim: bool) {
+    if super::follow::applying() {
+        forget();
+        return;
+    }
     let instead = taken();
     yo_alloc::allow(|| match instead {
         None if !verbatim => {}
@@ -642,6 +722,10 @@ pub(super) fn feed(server: &Server, db: usize, args: Args<'_>, verbatim: bool) {
 /// no verbatim form here: whatever the answering left is all there is, and an
 /// answering that left nothing did nothing.
 pub(super) fn served(server: &Server, db: usize) {
+    if super::follow::applying() {
+        forget();
+        return;
+    }
     let Some(each) = taken() else {
         return;
     };
@@ -695,6 +779,14 @@ pub(super) fn swept(server: &Server, db: usize) {
         return;
     }
     let each = REAPED.with_borrow_mut(core::mem::take);
+    // A replica that reaped a key on its own has nothing to tell anybody. The
+    // master is going to send the deletion in a moment and that is the copy that
+    // counts, because it is the one at the offset everybody else is counting
+    // from. See the `follow` module on why a chain passes bytes on rather than
+    // effects.
+    if super::follow::applying() {
+        return;
+    }
     yo_alloc::allow(|| {
         for one in &each {
             let parts: Vec<&[u8]> = one.iter().map(Vec::as_slice).collect();
@@ -892,6 +984,10 @@ pub(super) fn caught_up(server: &Server) -> usize {
 /// and the offset, which is a shape nobody would pick today and is the shape
 /// every client library already parses.
 pub(super) fn role(server: &Server, out: &mut Out) {
+    if server.following() {
+        super::follow::role(server, out);
+        return;
+    }
     let rows = server.replica_rows();
     out.array(3);
     out.bulk(b"master");
@@ -927,9 +1023,14 @@ pub(super) fn info(server: &Server, s: &mut String) {
     let now = server.clock.now_ms();
     let _ = write!(
         s,
-        "# Replication\r\nrole:master\r\nconnected_slaves:{}\r\n",
-        rows.len()
+        "# Replication\r\nrole:{}\r\n",
+        super::follow::role_word(server)
     );
+    // The master's own fields first when there is a master, which is where Redis
+    // puts them: a tool reading the section top to bottom finds out what this
+    // server is, then who it follows, then who follows it.
+    super::follow::info(server, s);
+    let _ = write!(s, "connected_slaves:{}\r\n", rows.len());
     for (i, held) in rows.iter().enumerate() {
         let (host, port) = held.address();
         let state = if held.online.load(Relaxed) {

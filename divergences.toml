@@ -1025,3 +1025,25 @@ title = "A claim that claimed nothing leaves a consumer only on the master"
 reason = "XCLAIM k g newconsumer 0 <an id that is not pending> creates the consumer and claims nothing, and nothing goes down the link, so the master has a consumer the replica does not. This is Redis's own behaviour rather than ours and it was measured that way, with a real 8.10.1 replica attached to a real 8.10.1 master: the master reports one consumer and the replica reports none. It is written down here because a compatibility suite that compares the two keyspaces after a claim will find it, and finding it in the register is better than finding it twice. The consumer is empty, so nothing about the group's pending list, bookmark or counters differs, and the next thing that consumer really claims creates it at the far end."
 status = "permanent"
 spec = "12 section 8"
+
+[[divergence]]
+id = "D-145"
+title = "A replica expires its own keys rather than waiting to be told"
+reason = "On a real server a replica never deletes an expired key on its own. It keeps it, hides it from a read, and waits for the DEL the master sends when the master notices. That is what makes a read on a replica agree with a read on the master at every instant, and it is also why a replica's key count can sit above its master's for as long as the master has not got round to sweeping. Here the expiry sweep runs on a replica the same as anywhere else, so the key goes when it is due and the DEL that arrives later finds nothing to do, which is harmless. Nothing a client can read is different, because a key past its deadline is not readable either way. What is different is DBSIZE and the key count in INFO between the moment a key expires and the moment the master says so, and a suite that compares those two numbers at exactly the wrong instant will see it. The sweep is what keeps memory flat on a replica of a master that writes with short deadlines, which is the reason it is left on."
+status = "permanent"
+spec = "12 section 9"
+
+[[divergence]]
+id = "D-146"
+title = "The link to a master is not a client"
+reason = "A real server registers the socket it reads its master's stream from as a client, so CLIENT LIST TYPE master shows one row on a replica and CLIENT KILL TYPE master is how a test breaks the link from the inside. Here the link is a thread with a socket of its own and no row in the client table, so both of those answer nothing. The reason is that everything the client table is for is the reactor: a row is what a poller registers, what CLIENT PAUSE holds and what an output buffer limit is measured against, and the link is none of those things. It has its own timeouts and its own retry, and a row would be a second way to reach it that the thread would then have to defend against. What a test wants instead is REPLICAOF NO ONE followed by REPLICAOF, which is exactly as good at breaking the link and says what it means. connected_clients does not count it either, on the same reasoning."
+status = "permanent"
+spec = "12 section 9"
+
+[[divergence]]
+id = "D-147"
+title = "repl-backlog-size is fixed for the life of the process"
+reason = "CONFIG SET repl-backlog-size on a real server really resizes the buffer, and here it is refused with the immutable config sentence unless the value asked for is the one it already is. The backlog is one allocation made once, and resizing it under a replica that is being caught up out of it means either copying it while somebody reads it or dropping what is in it, and dropping it turns the next reconnect that would have been partial into a full resync. Neither is worth doing for a setting almost nobody moves. CONFIG GET answers the real size, which is a megabyte and is the size Redis ships with, so a tool that reads it to work out how far behind a replica may fall before a full resync gets a true answer."
+status = "until"
+resolved_by = "M8"
+spec = "12 section 9"

@@ -202,6 +202,9 @@ pub(super) fn execute(
         return packing(server, session, args.get(2), Packing::Listpack, out);
     } else if is(sub, b"QUICKLIST") && (3..=4).contains(&args.len()) {
         return packing(server, session, args.get(2), Packing::Quicklist, out);
+    } else if is(sub, b"CHANGE-REPL-ID") && args.len() == 2 {
+        server.change_id();
+        out.ok();
     } else if is(sub, b"DIGEST") && args.len() == 2 {
         whole_digest(server, out);
     } else if is(sub, b"DIGEST-VALUE") {
@@ -873,6 +876,9 @@ fn protocol(kind: &[u8], out: &mut Out) -> Result<()> {
 /// What `DEBUG HELP` says, which is what is here and not what Redis has.
 const HELP: &[&str] = &[
     "DEBUG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+    "CHANGE-REPL-ID",
+    "    Change the replication IDs of the server. Useful for testing the",
+    "    replication sub system.",
     "DICT-RESIZING <0|1>",
     "    Enable or disable the background reclaim of room the store no longer",
     "    needs.",

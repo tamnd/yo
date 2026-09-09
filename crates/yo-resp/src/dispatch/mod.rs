@@ -65,6 +65,7 @@ mod cms;
 mod cpu;
 mod cuckoo;
 mod debug;
+mod follow;
 mod geo;
 mod graph;
 mod hashes;
@@ -113,9 +114,9 @@ pub use table::{COMMANDS, Spec, arity_ok, lookup};
 use crate::reply::Out;
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
+use std::sync::{Arc, Weak};
 use yo_common::lock::{Held, Lock};
 use yo_common::{Code, Error};
 use yo_kv::cold::Store;
@@ -927,6 +928,25 @@ pub struct Server {
     /// the write being copied is running on a thread that cannot reach the
     /// connection it has to be copied to. See the `repl` module.
     repl: repl::Replication,
+    /// Being a replica: who this server follows and the link out to them.
+    ///
+    /// Beside [`Server::repl`] rather than inside it because the two are
+    /// opposite halves of the same idea and a server is nearly always neither.
+    /// See the `follow` module.
+    follow: follow::Follower,
+    /// A handle on this server, for the one thing that outlives the command
+    /// that started it.
+    ///
+    /// The replica link is a thread, and a thread cannot borrow the server it
+    /// runs against, so it has to hold a counted handle. Nothing inside a
+    /// `Server` can make one of those out of a borrow, so the handle is put here
+    /// by whoever wrapped the server up, which is `Wire::over` and is the one
+    /// place that has both. Weak rather than strong, because a strong one would
+    /// be a server holding itself alive forever.
+    ///
+    /// Empty on an embedded caller that never built an engine, and `REPLICAOF`
+    /// says so rather than pretending to have started a link.
+    myself: Lock<Weak<Server>>,
     /// What the saves have done, which is all `INFO persistence` has to report.
     persist: persist::Persistence,
     /// Who is allowed to run what, which is also where `requirepass` lives.
@@ -994,6 +1014,8 @@ impl Server {
             pause: AtomicU64::new(0),
             monitors: monitor::Monitors::default(),
             repl: repl::Replication::default(),
+            follow: follow::Follower::default(),
+            myself: Lock::new(Weak::new()),
             persist: persist::Persistence::default(),
             acl: acl::Users::default(),
             acllog: acl::Log::default(),
@@ -1079,6 +1101,8 @@ impl Server {
             pause: AtomicU64::new(0),
             monitors: monitor::Monitors::default(),
             repl: repl::Replication::default(),
+            follow: follow::Follower::default(),
+            myself: Lock::new(Weak::new()),
             persist: persist::Persistence::default(),
             acl: acl::Users::default(),
             acllog: acl::Log::default(),
@@ -1484,6 +1508,43 @@ impl Server {
     /// clients share a number however many threads are accepting.
     pub fn next_client(&self) -> u64 {
         self.next_client.fetch_add(1, Relaxed)
+    }
+
+    /// Say which handle this server is behind, so a background thread can hold
+    /// one.
+    ///
+    /// Called by whoever wrapped it up, as many times as there are threads, and
+    /// every call after the first says the same thing. It cannot be worked out
+    /// from the inside, because a `&Server` has no way to reach the handle it
+    /// is behind, so whoever made the handle has to say.
+    pub fn is_behind(self: &Arc<Server>) {
+        let mut myself = self.myself.lock();
+        if myself.strong_count() == 0 {
+            *myself = Arc::downgrade(self);
+        }
+    }
+
+    /// Put that handle down again, so the server can be reached mutably.
+    ///
+    /// `Arc::get_mut` counts weak handles as well as strong ones, so a server
+    /// that knows what it is behind cannot be borrowed mutably while it knows
+    /// it. Everything that wants a mutable one is startup, which happens before
+    /// any thread could be holding the handle, so putting it down and picking it
+    /// up at the next [`Server::is_behind`] costs nothing and keeps the startup
+    /// path exactly as it was.
+    pub fn forget_behind(&self) {
+        let mut myself = self.myself.lock();
+        *myself = Weak::new();
+    }
+
+    /// A counted handle on this server, for a thread that outlives its caller.
+    ///
+    /// `None` on a server nobody wrapped up, and on one that is being dropped,
+    /// which is the same answer for the same reason: there is no server here to
+    /// hand a thread.
+    #[must_use]
+    pub(crate) fn myself(&self) -> Option<Arc<Server>> {
+        self.myself.lock().upgrade()
     }
 
     /// Which set of per thread state the calling thread is on.
@@ -2237,6 +2298,15 @@ pub struct Session {
     /// has no ACL never reads past the first field of it. See the `acl` module
     /// for why a copy rather than a lookup.
     acl: Box<acl::Identity>,
+    /// Whether what this session runs arrived from a master this server is
+    /// following.
+    ///
+    /// False on every connection anybody made, which is what keeps this to a
+    /// field read on the command path. It exempts the master's stream from the
+    /// three refusals that are about clients and not about it, being the
+    /// password, the access control list and the read only refusal, and from
+    /// `CLIENT PAUSE`. See the `follow` module for why each of those.
+    master: bool,
 }
 
 /// What a connection has asked to hear back, which is `CLIENT REPLY`.
@@ -2281,6 +2351,7 @@ impl Session {
             reply: Reply::On,
             sock: Arc::new(Client::new(id)),
             authenticated: false,
+            master: false,
             acl: Box::default(),
         }
     }
@@ -2299,6 +2370,21 @@ impl Session {
     #[must_use]
     pub(crate) fn authenticated(&self) -> bool {
         self.authenticated
+    }
+
+    /// Say that everything this session runs comes from a master.
+    ///
+    /// Called once, by the replica link, which is the only thing that can say
+    /// it. A session nobody tells is an ordinary client, which is every
+    /// connection on every server that is nobody's replica.
+    pub(crate) fn serve_master(&mut self, yes: bool) {
+        self.master = yes;
+    }
+
+    /// Whether what this session runs came from a master.
+    #[must_use]
+    pub(crate) fn serving_master(&self) -> bool {
+        self.master
     }
 
     /// The row every other thread sees this connection through.
@@ -2732,7 +2818,11 @@ pub fn resolved(
     // three that a client has to be able to send before it has a password
     // accepted: `HELLO`, which carries the option that authenticates, `RESET`,
     // which is how a client says it is starting over, and `QUIT`.
-    if server.guarded() && !session.authenticated() && !spec.flags.contains(&"no_auth") {
+    if server.guarded()
+        && !session.authenticated()
+        && !session.serving_master()
+        && !spec.flags.contains(&"no_auth")
+    {
         server.mine().cmdstats.at(spec).rejected.bump();
         if spec.name == "exec" {
             multi::abort(server, session, auth::NOAUTH, out);
@@ -2760,6 +2850,7 @@ pub fn resolved(
     // the default user able to do everything and a user who can do everything
     // cannot be refused anything.
     if server.restricted()
+        && !session.serving_master()
         && let Some(said) = acl::gate(server, session, spec, args, out)
     {
         server.mine().cmdstats.at(spec).rejected.bump();
@@ -2785,6 +2876,27 @@ pub fn resolved(
         server.mine().cmdstats.at(spec).rejected.bump();
         session.dirty_multi();
         out.error_line(b"OOM ", OOM);
+        return Flow::Continue;
+    }
+
+    // A write from a client on a replica is refused, which is what
+    // `replica-read-only` is and is on by default. Here, after the memory limit
+    // and before the queue below, which is where a real server puts it, so a
+    // write queued inside a transaction on a replica is refused as it is queued
+    // and the whole transaction comes back as an `EXECABORT`.
+    //
+    // Two loads on a server that is nobody's replica, both of a bool that is
+    // false, and the first of them is the one that is nearly always the answer.
+    // The master's own stream goes through, which is the entire point: a replica
+    // that refused its master's writes would be a replica of nothing.
+    if server.read_only_replica() && !session.serving_master() && spec.flags.contains(&"write") {
+        server.mine().cmdstats.at(spec).rejected.bump();
+        if spec.name == "exec" {
+            multi::abort(server, session, follow::READONLY, out);
+        } else {
+            session.dirty_multi();
+            out.error(follow::READONLY.as_bytes());
+        }
         return Flow::Continue;
     }
 
@@ -2836,6 +2948,7 @@ pub fn resolved(
     // mean a transaction that has written half of itself and stopped.
     if !session.running
         && !session.monitoring()
+        && !session.serving_master()
         && let Some(all) = server.paused(server.now_ms())
         && (all || may_replicate(spec, session))
     {
@@ -31873,6 +31986,150 @@ mod tests {
         let body = reply.split_once("\r\n").expect("a header ends").1;
         assert!(body.starts_with('$'), "{body:?}");
         assert!(!body.ends_with("\r\n"), "{body:?}");
+    }
+
+    // ------------------------------------------------------ being a replica
+
+    /// The whole point of the read only refusal, and the read that goes through.
+    #[test]
+    fn a_read_only_replica_refuses_a_write_and_answers_a_read() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"v"]);
+        f.server.pretend_following("127.0.0.1", 6379, true);
+        assert_eq!(
+            f.run(&[b"SET", b"k", b"other"]),
+            "-READONLY You can't write against a read only replica.\r\n"
+        );
+        assert_eq!(f.run(&[b"GET", b"k"]), "$1\r\nv\r\n");
+        // And a command that is not a write at all is not touched by any of it.
+        assert_eq!(f.run(&[b"PING"]), "+PONG\r\n");
+    }
+
+    /// The refusal is off on a server that is nobody's replica, whatever the
+    /// setting says, because the setting is about being a replica.
+    #[test]
+    fn a_master_takes_writes_however_the_read_only_setting_is_left() {
+        let mut f = Fixture::new();
+        f.server.set_replica_read_only(true);
+        assert_eq!(f.run(&[b"SET", b"k", b"v"]), "+OK\r\n");
+        f.server.pretend_following("127.0.0.1", 6379, true);
+        assert!(f.run(&[b"SET", b"k", b"v"]).starts_with("-READONLY"));
+        // And a replica that was told it is writable takes the write.
+        f.server.set_replica_read_only(false);
+        assert_eq!(f.run(&[b"SET", b"k", b"v"]), "+OK\r\n");
+        f.server.set_replica_read_only(true);
+        // Stopping being a replica is enough on its own, with the setting left
+        // exactly where it was.
+        f.server.pretend_master();
+        assert_eq!(f.run(&[b"SET", b"k", b"v"]), "+OK\r\n");
+    }
+
+    /// The master's own connection is what the refusal is not for.
+    #[test]
+    fn the_link_to_the_master_writes_through_the_read_only_refusal() {
+        let mut f = Fixture::new();
+        f.server.pretend_following("127.0.0.1", 6379, true);
+        assert!(f.run(&[b"SET", b"k", b"v"]).starts_with("-READONLY"));
+        f.session.serve_master(true);
+        assert_eq!(f.run(&[b"SET", b"k", b"v"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"GET", b"k"]), "$1\r\nv\r\n");
+    }
+
+    /// A refused `EXEC` fails the whole transaction rather than one command in
+    /// it, which is the same rule every other gate in `resolved` follows.
+    #[test]
+    fn a_transaction_on_a_read_only_replica_is_refused_whole() {
+        let mut f = Fixture::new();
+        f.server.pretend_following("127.0.0.1", 6379, true);
+        f.run(&[b"MULTI"]);
+        assert!(f.run(&[b"SET", b"k", b"v"]).starts_with("-READONLY"));
+        assert!(f.run(&[b"EXEC"]).starts_with("-EXECABORT"));
+    }
+
+    /// What an operator reads to find out who this server is following.
+    #[test]
+    fn a_replica_says_who_it_follows_in_info_and_in_role() {
+        let mut f = Fixture::new();
+        assert!(f.run(&[b"INFO", b"replication"]).contains("role:master"));
+        f.server.pretend_following("10.0.0.4", 7000, true);
+        let info = f.run(&[b"INFO", b"replication"]);
+        assert!(info.contains("role:slave"), "{info}");
+        assert!(info.contains("master_host:10.0.0.4"), "{info}");
+        assert!(info.contains("master_port:7000"), "{info}");
+        assert!(info.contains("master_link_status:up"), "{info}");
+        assert!(info.contains("slave_read_only:1"), "{info}");
+        // The five element replica form, and the state word is the one that
+        // tells an operator whether anything is arriving.
+        let role = f.run(&[b"ROLE"]);
+        assert!(role.starts_with("*5\r\n$5\r\nslave\r\n"), "{role}");
+        assert!(role.contains("10.0.0.4"), "{role}");
+        assert!(role.contains("connected"), "{role}");
+        // A link that is down says so in both places rather than in one.
+        f.server.pretend_following("10.0.0.4", 7000, false);
+        assert!(
+            f.run(&[b"INFO", b"replication"])
+                .contains("master_link_status:down"),
+            "a link that is not up is down"
+        );
+        assert!(f.run(&[b"ROLE"]).contains("connect"));
+    }
+
+    /// A server nobody wrapped in a handle cannot start a link, and says so
+    /// rather than answering `OK` and doing nothing.
+    #[test]
+    fn replicaof_on_an_embedded_server_says_it_is_not_available() {
+        let mut f = Fixture::new();
+        let said = f.run(&[b"REPLICAOF", b"127.0.0.1", b"6379"]);
+        assert!(
+            said.contains("not available on an embedded server"),
+            "{said}"
+        );
+        // The arity and the port are checked first, so a caller that got the
+        // command wrong hears about that and not about the handle.
+        assert!(
+            f.run(&[b"REPLICAOF", b"127.0.0.1"])
+                .starts_with("-ERR wrong number")
+        );
+        assert_eq!(
+            f.run(&[b"SLAVEOF", b"127.0.0.1", b"abc"]),
+            "-ERR Invalid master port\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"REPLICAOF", b"127.0.0.1", b"99999"]),
+            "-ERR Invalid master port\r\n"
+        );
+    }
+
+    /// Promotion keeps the history it was part of, which is what lets the
+    /// replicas that shared it carry on rather than start again.
+    #[test]
+    fn a_promotion_keeps_the_old_history_as_the_second_id() {
+        let f = Fixture::new();
+        let was = f.server.repl_id();
+        f.server.promote();
+        assert_ne!(f.server.repl_id(), was);
+        let info = {
+            let mut f = f;
+            f.run(&[b"INFO", b"replication"])
+        };
+        let was = String::from_utf8_lossy(&was).into_owned();
+        assert!(info.contains(&format!("master_replid2:{was}")), "{info}");
+    }
+
+    /// `DEBUG CHANGE-REPL-ID` is the opposite: a new history and no claim on the
+    /// old one, so the next `PSYNC` between two servers that shared it is full.
+    #[test]
+    fn change_repl_id_takes_a_new_id_and_forgets_the_old_one() {
+        let mut f = Fixture::new();
+        let was = f.server.repl_id();
+        f.server.promote();
+        assert_eq!(f.run(&[b"DEBUG", b"CHANGE-REPL-ID"]), "+OK\r\n");
+        assert_ne!(f.server.repl_id(), was);
+        let info = f.run(&[b"INFO", b"replication"]);
+        assert!(
+            info.contains(&format!("master_replid2:{}", "0".repeat(40))),
+            "{info}"
+        );
     }
 
     /// A transaction crosses as the commands it ran, which is D-141: a real
