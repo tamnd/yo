@@ -1528,6 +1528,31 @@ impl Server {
         sum
     }
 
+    /// The same numbers kept apart, one entry per thread, in slot order.
+    ///
+    /// [`Self::totals`] is the sum and it is the sum that answers how busy the
+    /// server has been. What it cannot answer is whether the threads are
+    /// carrying the same load as each other, and on a server where every thread
+    /// keeps the connections it accepted for as long as they are open, that is
+    /// a question with real consequences: an uneven split is paid by the clients
+    /// on the crowded thread and is invisible in every number that adds the
+    /// threads up first.
+    ///
+    /// The length is how many threads the server was built for rather than how
+    /// many have counted anything, so a thread that has not run a command yet
+    /// shows as zeroes instead of being missing.
+    #[must_use]
+    pub fn per_thread(&self) -> Vec<Totals> {
+        self.locals
+            .iter()
+            .map(|thread| Totals {
+                clients: thread.stats.clients.get(),
+                connections: thread.stats.connections.get(),
+                commands: thread.stats.commands.get(),
+            })
+            .collect()
+    }
+
     /// Put the totals back to zero, which is `CONFIG RESETSTAT`.
     ///
     /// Every thread's set and not only the one asking, since the number the
@@ -8483,6 +8508,43 @@ mod tests {
             1,
             "{with_default}"
         );
+    }
+
+    /// The threads section is the sum taken apart again.
+    ///
+    /// A connection belongs to the thread that accepted it for as long as it is
+    /// open, so how the connections landed decides who does the work, and every
+    /// other number in `INFO` adds the threads up before anybody sees it. This
+    /// is the one place the split itself is visible. The test runs on one
+    /// thread, so what it can show is that the section has a row per thread, and
+    /// that the work it did all landed in one of them and adds back up to the
+    /// total.
+    #[test]
+    fn the_threads_section_says_where_the_work_landed() {
+        let mut server = Server::new();
+        server.set_threads(4);
+        let mut f = Fixture::on(server);
+        for _ in 0..3 {
+            f.run(&[b"PING"]);
+        }
+
+        assert!(!f.run(&[b"INFO"]).contains("# Threads"));
+        assert!(f.run(&[b"INFO", b"all"]).contains("# Threads"));
+
+        let info = f.run(&[b"INFO", b"threads"]);
+        assert!(info.contains("io_threads:4"), "{info}");
+        for at in 0..4 {
+            assert!(info.contains(&format!("thread_{at}:clients=")), "{info}");
+        }
+        assert!(!info.contains("thread_4:"), "{info}");
+
+        let per = f.server.per_thread();
+        assert_eq!(per.len(), 4);
+        assert_eq!(
+            per.iter().map(|t| t.commands).sum::<u64>(),
+            f.server.totals().commands
+        );
+        assert_eq!(per.iter().filter(|t| t.commands > 0).count(), 1, "{per:?}");
     }
 
     /// The memory section says what this process may use, not what the machine
