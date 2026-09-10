@@ -2341,6 +2341,24 @@ pub struct Session {
     /// command moves the second into the first.
     asking: bool,
     asking_next: bool,
+    /// Whether this connection is another node of the cluster rather than a
+    /// client.
+    ///
+    /// Set by `AUTH "internal connection" <secret>`, where the secret is the
+    /// forty characters the bus has gossiped the whole cluster onto, so a client
+    /// cannot set it without already knowing something only the nodes know. What
+    /// it opens is the slot migration protocol, which changes state a client has
+    /// no business changing and which is deliberately not guarded against being
+    /// driven out of order, since the only thing that ever drives it is another
+    /// node following the same state machine.
+    internal: bool,
+    /// Whether the socket goes as soon as the reply to the command running right
+    /// now has been written, which is the reference's `CLIENT_CLOSE_AFTER_REPLY`.
+    ///
+    /// One command sets it, which is a `CLUSTER SYNCSLOTS` from a connection
+    /// that is not a node. The refusal on its own would be enough to be correct
+    /// and the hang up is what makes it expensive to sit there guessing.
+    closing: bool,
 }
 
 /// What a connection has asked to hear back, which is `CLIENT REPLY`.
@@ -2388,6 +2406,8 @@ impl Session {
             master: false,
             asking: false,
             asking_next: false,
+            internal: false,
+            closing: false,
             acl: Box::default(),
         }
     }
@@ -2421,6 +2441,36 @@ impl Session {
     #[must_use]
     pub(crate) fn serving_master(&self) -> bool {
         self.master
+    }
+
+    /// Say whether this connection is another node of the cluster.
+    ///
+    /// The one thing that says yes is `AUTH "internal connection"` with the
+    /// right secret, and `DEBUG MARK-INTERNAL-CLIENT` says it too so that a test
+    /// can drive the protocol without a second node.
+    pub(crate) fn serve_internal(&mut self, yes: bool) {
+        self.internal = yes;
+    }
+
+    /// Whether this connection is another node of the cluster.
+    ///
+    /// A master's own stream counts as one, because everything a replica is told
+    /// by its master is by definition from a node, which is the reference's rule
+    /// as well.
+    #[must_use]
+    pub(crate) fn internal(&self) -> bool {
+        self.internal || self.master
+    }
+
+    /// Ask that the socket goes once the reply being written has gone out.
+    pub(crate) fn hang_up(&mut self) {
+        self.closing = true;
+    }
+
+    /// Whether it has been asked.
+    #[must_use]
+    pub(crate) fn hanging_up(&self) -> bool {
+        self.closing
     }
 
     /// Let the command after this one into a slot this node is receiving, which
@@ -3393,6 +3443,13 @@ pub fn resolved(
     row.calls.bump();
     if matches!(out.as_slice().get(mark), Some(b'-' | b'!')) {
         row.failed.bump();
+    }
+    // Last of all, because the reply the client is being hung up on still has to
+    // be written first. A command that asked for this has decided the connection
+    // is not one it wants to keep talking to, which so far is only a client
+    // caught reaching for the slot migration protocol.
+    if session.hanging_up() {
+        return Flow::Close;
     }
     flow
 }
@@ -32575,6 +32632,263 @@ mod tests {
         assert_eq!(
             f.run(&[b"GET", b"foo"]),
             format!("-MOVED {FOO} 10.0.0.9:7002\r\n")
+        );
+    }
+
+    /// The slot migration protocol is shut to anybody who is not a node, and the
+    /// connection goes with the refusal.
+    ///
+    /// The hang up is the reference's and it is the part worth having. Nothing
+    /// behind this command checks that it is being driven in order, because the
+    /// only thing that ever drives it is another node following the same state
+    /// machine, so the whole defence is getting in at all and making a guess cost
+    /// a fresh connection is most of that defence.
+    #[test]
+    fn the_slot_migration_protocol_is_shut_to_a_client() {
+        let mut f = clustered();
+        // The arity is read first, so a client that sends the container on its own
+        // is told that much and keeps its connection.
+        let (flow, reply) = f.flow(&[b"CLUSTER", b"SYNCSLOTS"]);
+        assert_eq!(
+            reply,
+            "-ERR wrong number of arguments for 'cluster|syncslots' command\r\n"
+        );
+        assert_eq!(flow, Flow::Continue);
+        let (flow, reply) = f.flow(&[b"CLUSTER", b"SYNCSLOTS", b"CONF", b"capa", b"x"]);
+        assert_eq!(
+            reply,
+            "-ERR CLUSTER SYNCSLOTS subcommands are only allowed for internal clients\r\n"
+        );
+        assert_eq!(flow, Flow::Close, "and the socket goes with it");
+    }
+
+    /// The one way in is the secret the whole cluster has agreed on, and there is
+    /// no secret at all on a server that is not in a cluster.
+    #[test]
+    fn the_internal_login_wants_the_cluster_secret() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"AUTH", b"internal connection", b"x"]),
+            "-ERR Cannot authenticate as an internal connection on non-cluster instances\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"DEBUG", b"INTERNAL_SECRET"]),
+            "-ERR Internal secret is missing\r\n"
+        );
+        let mut f = clustered();
+        assert_eq!(
+            f.run(&[b"AUTH", b"internal connection", b"x"]),
+            "-WRONGPASS invalid internal password\r\n"
+        );
+        // The name is matched exactly and not the way a keyword is, so this is a
+        // failed login as a user of that name rather than a failed internal one.
+        assert_eq!(
+            f.run(&[b"AUTH", b"INTERNAL CONNECTION", b"x"]),
+            "-WRONGPASS invalid username-password pair or user is disabled.\r\n"
+        );
+        let secret = f.server.cluster_secret();
+        assert_eq!(secret.len(), 40, "forty characters, like a node id");
+        assert_eq!(
+            f.run(&[b"DEBUG", b"INTERNAL_SECRET"]),
+            format!(":{}\r\n", yo_common::crc::crc16(secret.as_bytes())),
+            "what comes back is a checksum, so a test can see two nodes agree \
+             and nobody can log in with what they read"
+        );
+        assert_eq!(
+            f.run(&[b"AUTH", b"internal connection", secret.as_bytes()]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"SYNCSLOTS", b"CONF", b"capa", b"x"]),
+            "+OK\r\n"
+        );
+    }
+
+    /// `CONF` carries on past an option it did not understand and still says
+    /// `OK`, so one command can answer with two replies.
+    #[test]
+    fn conf_says_ok_after_an_option_it_did_not_know() {
+        let mut f = clustered();
+        assert_eq!(f.run(&[b"DEBUG", b"MARK-INTERNAL-CLIENT"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"SYNCSLOTS", b"CONF", b"zzz", b"1"]),
+            "-ERR Unknown option zzz\r\n+OK\r\n"
+        );
+        // A capability nobody here has heard of is not an unknown option, which
+        // is what lets a newer node say something to an older one.
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"SYNCSLOTS", b"CONF", b"capa", b"quantum"]),
+            "+OK\r\n"
+        );
+        // The node saying who it is has to be a node this one knows.
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"SYNCSLOTS", b"CONF", b"node-id", b"abc"]),
+            "-ERR Invalid node id length 3\r\n"
+        );
+        let unknown = b"1111111111111111111111111111111111111111";
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"SYNCSLOTS", b"CONF", b"node-id", unknown]),
+            "-ERR Node 1111111111111111111111111111111111111111 not found in cluster\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"CLUSTER",
+                b"SYNCSLOTS",
+                b"CONF",
+                b"node-id",
+                b"5b1e2ce29b1e0c86bd53ee1e5b0dd7b66c0e6e0f"
+            ]),
+            "+OK\r\n"
+        );
+        // The size hint is three numbers and the first of them is a slot.
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"SYNCSLOTS", b"CONF", b"slot-info", b"5:10:2"]),
+            "+OK\r\n"
+        );
+        for bad in [b"zz".as_slice(), b"16384:0:0", b"5:10:2:3", b"5:-1:0"] {
+            assert_eq!(
+                f.run(&[b"CLUSTER", b"SYNCSLOTS", b"CONF", b"slot-info", bad]),
+                format!(
+                    "-ERR Invalid slot info: {}\r\n",
+                    String::from_utf8_lossy(bad)
+                )
+            );
+        }
+        // And a master has no business being told what its own migration looks
+        // like, since it is the one running it.
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"SYNCSLOTS", b"CONF", b"asm-task", b"x"]),
+            "-ERR CLUSTER SYNCSLOTS CONF ASM-TASK only allowed on replica\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"DEBUG", b"MARK-INTERNAL-CLIENT", b"UNMARK"]),
+            "+OK\r\n"
+        );
+        let (flow, _) = f.flow(&[b"CLUSTER", b"SYNCSLOTS", b"CONF", b"capa", b"x"]);
+        assert_eq!(flow, Flow::Close, "and the door shuts again");
+    }
+
+    /// The slot ranges are checked in full before anything is asked to move, and
+    /// the answers name what is wrong with them.
+    #[test]
+    fn the_slot_ranges_of_a_sync_are_checked_in_full() {
+        let mut f = clustered();
+        f.run(&[b"DEBUG", b"MARK-INTERNAL-CLIENT"]);
+        let id = b"5b1e2ce29b1e0c86bd53ee1e5b0dd7b66c0e6e0f";
+        fn sync<'a>(id: &'a [u8], slots: &[&'a [u8]]) -> Vec<&'a [u8]> {
+            let mut parts: Vec<&[u8]> = vec![b"CLUSTER", b"SYNCSLOTS", b"SYNC", id];
+            parts.extend_from_slice(slots);
+            parts
+        }
+        let bar = BAR.to_string();
+        let bar = bar.as_bytes();
+        assert_eq!(
+            f.run(&sync(id, &[b"5", b"4"])),
+            "-ERR start slot number 5 is greater than end slot number 4\r\n"
+        );
+        assert_eq!(
+            f.run(&sync(id, &[b"99999", b"2"])),
+            "-ERR Invalid or out of range slot\r\n"
+        );
+        // Ranges that touch are joined up and ranges that overlap are not, so
+        // this is one slot asked for twice and the one below is a run of four.
+        assert_eq!(
+            f.run(&sync(id, &[b"1", b"2", b"2", b"3"])),
+            "-ERR Slot 2 specified multiple times\r\n"
+        );
+        assert_eq!(
+            f.run(&sync(id, &[b"1", b"2", b"3", b"4"])),
+            "-ERR CLUSTER SYNCSLOTS SYNC is not implemented yet, move the slot with SETSLOT and MIGRATE\r\n"
+        );
+        // A slot somebody else owns is not this node's to send.
+        f.server.cluster_hand_over(BAR, 1);
+        assert_eq!(
+            f.run(&sync(id, &[bar])),
+            "-ERR syntax error\r\n",
+            "one slot number is not a range, and a shape it does not know is a \
+             syntax error rather than a count it can complain about"
+        );
+        assert_eq!(
+            f.run(&sync(id, &[bar, bar])),
+            "-ERR This node is not the owner of the slots\r\n"
+        );
+        // And neither way of moving a slot runs while the other one is half done.
+        f.server.cluster_moving(FOO, Some(1), None);
+        assert_eq!(
+            f.run(&sync(id, &[b"1", b"2"])),
+            "-ERR all slot states must be STABLE to start a slot migration task.\r\n"
+        );
+    }
+
+    /// A replica takes one thing off its master and nothing at all off anybody
+    /// else, because there is nothing it could be being asked to hand over.
+    #[test]
+    fn a_replica_only_hears_the_settings_and_only_from_its_master() {
+        let mut server = Server::new();
+        server.enable_cluster("", 7000);
+        let of = server.cluster_pretend_node(
+            "5b1e2ce29b1e0c86bd53ee1e5b0dd7b66c0e6e0f",
+            "10.0.0.9",
+            7002,
+        );
+        server.cluster_pretend_follower(of);
+        let mut f = Fixture::on(server);
+        f.run(&[b"DEBUG", b"MARK-INTERNAL-CLIENT"]);
+        let (flow, reply) = f.flow(&[b"CLUSTER", b"SYNCSLOTS", b"CONF", b"capa", b"x"]);
+        assert_eq!(
+            reply,
+            "-ERR CLUSTER SYNCSLOTS subcommands are only allowed for master\r\n"
+        );
+        assert_eq!(flow, Flow::Close);
+        // Off the master's own stream the settings go through, and anything else
+        // is dropped without a word rather than refused, because an error written
+        // into the replication stream is an error nobody reads.
+        f.session.serve_master(true);
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"SYNCSLOTS", b"CONF", b"capa", b"x"]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"CLUSTER", b"SYNCSLOTS", b"SNAPSHOT-EOF"]), "");
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"SYNCSLOTS", b"CONF", b"asm-task", b"x"]),
+            "-ERR Failed to handle master task: x\r\n+OK\r\n",
+            "there is no migration for a replica to follow along with yet, and \
+             this option is one the reference keeps going past as well"
+        );
+    }
+
+    /// The arms that answer nothing at all, which is how the far side of a
+    /// migration says something it does not expect a reply to.
+    #[test]
+    fn the_one_way_arms_of_the_protocol_say_nothing_back() {
+        let mut f = clustered();
+        f.run(&[b"DEBUG", b"MARK-INTERNAL-CLIENT"]);
+        assert_eq!(f.run(&[b"CLUSTER", b"SYNCSLOTS", b"ACK", b"x", b"1"]), "");
+        assert_eq!(f.run(&[b"CLUSTER", b"SYNCSLOTS", b"FAIL", b"boom"]), "");
+        // The two that say a transfer has ended do the same and drop the
+        // connection, since there is no transfer here for them to be about.
+        let (flow, reply) = f.flow(&[b"CLUSTER", b"SYNCSLOTS", b"STREAM-EOF"]);
+        assert_eq!(reply, "");
+        assert_eq!(flow, Flow::Close);
+        // And the one arm that has a real answer on a node with nothing running.
+        let mut f = clustered();
+        f.run(&[b"DEBUG", b"MARK-INTERNAL-CLIENT"]);
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"SYNCSLOTS", b"RDBCHANNEL", b"abc"]),
+            "-ERR Invalid task id\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"CLUSTER",
+                b"SYNCSLOTS",
+                b"RDBCHANNEL",
+                b"0000000000000000000000000000000000000000"
+            ]),
+            "-ERR No slot migration task in progress\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"SYNCSLOTS", b"NONSENSE"]),
+            "-ERR syntax error\r\n"
         );
     }
 

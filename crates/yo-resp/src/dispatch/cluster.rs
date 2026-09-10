@@ -54,8 +54,8 @@ use yo_common::{Code, Error, Result};
 
 use crate::reply::Out;
 
-use super::Server;
 use super::args::{self, Args};
+use super::{Server, Session};
 
 mod bus;
 use super::keyspec;
@@ -528,6 +528,12 @@ impl Server {
         yo_alloc::allow(|| {
             *self.cluster.map.lock() = Map::new(me);
             *self.cluster.file.lock() = path;
+            // The secret nodes recognise each other by is made here rather than
+            // when the bus starts, because a node with no bus still has to have
+            // one: the whole cluster ends up on the smallest secret anybody
+            // started with, and a node holding an empty string would win that
+            // and leave everybody with no secret at all.
+            *self.cluster.bus.secret.lock() = String::from_utf8_lossy(&new_id()).into_owned();
         });
         // Whatever was written last time this node ran, if anything was. A node
         // that comes back without its slots is a node that has silently given
@@ -537,6 +543,20 @@ impl Server {
             eprintln!("cluster config file could not be read: {e}");
         }
         self.recount_coverage();
+    }
+
+    /// The secret one node authenticates to another node's client port with.
+    ///
+    /// Forty hex characters on a cluster node and empty on anything else, which
+    /// is what makes `AUTH "internal connection"` impossible to get past on a
+    /// server that is not in a cluster: there is no secret to guess.
+    ///
+    /// Handed out as a copy because it is read on `AUTH` and nowhere else, so
+    /// one allocation on a command that runs once a connection is cheaper than
+    /// keeping the lock held across a comparison.
+    pub(crate) fn cluster_secret(&self) -> String {
+        let held = self.cluster.bus.secret.lock();
+        yo_alloc::allow(|| held.clone())
     }
 
     /// Whether every slot has to be covered before anything is served.
@@ -813,10 +833,11 @@ fn redirect(word: &str, slot: u16, node: &(String, u16)) -> Error {
 /// `CLUSTER <subcommand> ...`.
 pub(super) fn execute(
     server: &Server,
-    session_db: usize,
+    session: &mut Session,
     args: Args<'_>,
     out: &mut Out,
 ) -> Result<()> {
+    let session_db = session.db;
     let sub = args.get(1);
     // Every subcommand but `HELP` and the two that are only about arguments is
     // refused outright on a server that was not started as a cluster node, which
@@ -886,12 +907,7 @@ pub(super) fn execute(
         }
         () if args::is(sub, b"slot-stats") => slot_stats(server, session_db, args, out)?,
         () if args::is(sub, b"migration") => migration(server, args, out)?,
-        () if args::is(sub, b"syncslots") => {
-            return Err(Error::new(
-                Code::Invalid,
-                "CLUSTER SYNCSLOTS subcommands are only allowed for internal clients",
-            ));
-        }
+        () if args::is(sub, b"syncslots") => syncslots(server, session, args, out)?,
         () if args::is(sub, b"saveconfig") => {
             save(server)?;
             out.ok();
@@ -1708,25 +1724,13 @@ fn migration(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
     if !args::is(action, b"import") {
         return Err(Error::new(Code::Invalid, "unknown argument"));
     }
-    if args.len() < 5 || !(args.len() - 3).is_multiple_of(2) {
-        return Err(wrong_sub_arity(sub));
-    }
-    let mut at = 3;
-    let mut wanted = Vec::new();
-    while at < args.len() {
-        let from = slot_arg(&args, at)?;
-        let to = slot_arg(&args, at + 1)?;
-        if from > to {
-            return Err(Error::fmt(
-                Code::Invalid,
-                format_args!("start slot number {from} is greater than end slot number {to}"),
-            ));
-        }
-        wanted.extend(from..=to);
-        at += 2;
-    }
+    let ranges = slot_ranges(&args, 3)?;
     let map = server.cluster.map.lock();
-    if wanted.iter().all(|slot| map.mine(*slot)) {
+    if ranges
+        .iter()
+        .flat_map(|(from, to)| *from..=*to)
+        .all(|slot| map.mine(slot))
+    {
         return Err(Error::new(
             Code::Invalid,
             "this node is already the owner of the slot range",
@@ -1734,6 +1738,303 @@ fn migration(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
     }
     drop(map);
     Err(not_yet("CLUSTER MIGRATION IMPORT"))
+}
+
+/// The list of slot ranges the tail of an argument list spells out, which is the
+/// reference's `parseSlotRangesOrReply` and the validation behind it.
+///
+/// Sorted and with the ranges that touch joined up, because that is what the
+/// reference hands back and the two checks after it are made against the joined
+/// up list rather than what the caller typed. Ranges that touch join and ranges
+/// that overlap do not, which is what makes `1 2 2 3` a slot named twice while
+/// `1 2 3 4` is one range of four.
+fn slot_ranges(args: &Args<'_>, from: usize) -> Result<Vec<(u16, u16)>> {
+    let count = args.len().saturating_sub(from);
+    if count < 2 || !count.is_multiple_of(2) {
+        return Err(wrong_sub_arity(args.get(1)));
+    }
+    if count / 2 >= SLOTS {
+        return Err(Error::fmt(
+            Code::Invalid,
+            format_args!("invalid number of slot ranges: {}", count / 2),
+        ));
+    }
+    let mut ranges: Vec<(u16, u16)> = Vec::with_capacity(count / 2);
+    let mut at = from;
+    while at < args.len() {
+        ranges.push((slot_arg(args, at)?, slot_arg(args, at + 1)?));
+        at += 2;
+    }
+    ranges.sort_unstable();
+    let mut joined: Vec<(u16, u16)> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match joined.last_mut() {
+            Some(last) if u32::from(last.1) + 1 == u32::from(range.0) => last.1 = range.1,
+            _ => joined.push(range),
+        }
+    }
+    let mut seen = vec![false; SLOTS];
+    for &(start, end) in &joined {
+        if start > end {
+            return Err(Error::fmt(
+                Code::Invalid,
+                format_args!("start slot number {start} is greater than end slot number {end}"),
+            ));
+        }
+        for slot in start..=end {
+            if core::mem::replace(&mut seen[usize::from(slot)], true) {
+                return Err(Error::fmt(
+                    Code::Invalid,
+                    format_args!("Slot {slot} specified multiple times"),
+                ));
+            }
+        }
+    }
+    Ok(joined)
+}
+
+/// `CLUSTER SYNCSLOTS`, which is what two nodes say to each other while a slot
+/// range moves from one to the other under atomic slot migration.
+///
+/// Not a command an operator ever types. The node taking the slots opens an
+/// ordinary client connection to the node giving them up, logs in as the cluster
+/// rather than as a user, and drives the whole move over that connection and one
+/// more like it. So every arm here answers another node running the same code,
+/// which is why the reference does not defend the state machine against being
+/// driven out of order and why it hangs up on anybody who is not a node rather
+/// than just saying no. Getting to the point of being able to send this is the
+/// hard part and the refusal makes it worthless.
+///
+/// What is in so far is the gate, the argument checking and the two arms that
+/// have a real answer on a node with no migration running, which is every node
+/// today. Starting a migration is D-149.
+fn syncslots(server: &Server, session: &mut Session, args: Args<'_>, out: &mut Out) -> Result<()> {
+    if !session.internal() {
+        // The hang up is the reference's and it is worth copying. The sentence on
+        // its own would be enough to be correct, and dropping the connection is
+        // what makes sitting there guessing at the protocol expensive.
+        session.hang_up();
+        return Err(Error::new(
+            Code::Invalid,
+            "CLUSTER SYNCSLOTS subcommands are only allowed for internal clients",
+        ));
+    }
+    let action = args.get(2);
+    if !server.cluster.map.lock().nodes[0].is_master() {
+        // A replica owns nothing, so there is nothing anybody could be asking it
+        // to hand over. The one thing it does take is `CONF`, and only from its
+        // own master, which is how it hears about the migration its master is in
+        // the middle of. Anything else from the master is dropped in silence
+        // rather than refused, because an error written into the replication
+        // stream is an error nobody reads.
+        if !session.serving_master() {
+            session.hang_up();
+            return Err(Error::new(
+                Code::Invalid,
+                "CLUSTER SYNCSLOTS subcommands are only allowed for master",
+            ));
+        }
+        if !args::is(action, b"conf") {
+            return Ok(());
+        }
+    }
+    if args::is(action, b"sync") && args.len() >= 6 {
+        return sync(server, args);
+    }
+    if args::is(action, b"rdbchannel") && args.len() == 4 {
+        if args.get(3).len() != ID_LEN {
+            return Err(Error::new(Code::Invalid, "Invalid task id"));
+        }
+        return Err(Error::new(
+            Code::Invalid,
+            "No slot migration task in progress",
+        ));
+    }
+    if (args::is(action, b"snapshot-eof") || args::is(action, b"stream-eof")) && args.len() == 3 {
+        // Both of these say a transfer has ended, and on a node with no transfer
+        // running the reference logs that it was not expecting them and drops the
+        // connection without writing anything back.
+        session.hang_up();
+        return Ok(());
+    }
+    if (args::is(action, b"ack") && args.len() == 5)
+        || (args::is(action, b"fail") && args.len() == 4)
+    {
+        // The two arms that never answer. `ACK` moves a number on the task it
+        // belongs to and there is no task, and `FAIL` does nothing at all on the
+        // reference either: it is there so that the far side has something to
+        // send that will not come back as a syntax error.
+        return Ok(());
+    }
+    if args::is(action, b"conf") && args.len() >= 5 {
+        return conf(server, args, out);
+    }
+    Err(args::syntax())
+}
+
+/// `CLUSTER SYNCSLOTS SYNC <task-id> <start> <end> [<start> <end> ...]`, which is
+/// the node taking the slots asking for them.
+///
+/// Every check the reference makes before it forks is made here, because they
+/// are what a caller reads to find out it asked the wrong node, and only the
+/// part that needs a snapshot to send is missing.
+fn sync(server: &Server, args: Args<'_>) -> Result<()> {
+    if !args.len().is_multiple_of(2) {
+        return Err(wrong_sub_arity(args.get(1)));
+    }
+    let ranges = slot_ranges(&args, 4)?;
+    {
+        let map = server.cluster.map.lock();
+        // The two ways of moving a slot do not mix. A slot that is half way
+        // through the old one has keys on two nodes at once and a snapshot of it
+        // would be a snapshot of half the data.
+        if (0..SLOTS).any(|at| map.migrating[at].is_some() || map.importing[at].is_some()) {
+            return Err(Error::new(
+                Code::Invalid,
+                "all slot states must be STABLE to start a slot migration task.",
+            ));
+        }
+        let mut source = None;
+        for slot in ranges.iter().flat_map(|(from, to)| *from..=*to) {
+            let Some(owner) = map.owner[usize::from(slot)] else {
+                return Err(Error::fmt(
+                    Code::Invalid,
+                    format_args!("slot has no owner: {slot}"),
+                ));
+            };
+            if *source.get_or_insert(owner) != owner {
+                return Err(Error::new(
+                    Code::Invalid,
+                    "slots belong to different source nodes",
+                ));
+            }
+        }
+        if source != Some(0) {
+            return Err(Error::new(
+                Code::Invalid,
+                "This node is not the owner of the slots",
+            ));
+        }
+    }
+    Err(not_yet("CLUSTER SYNCSLOTS SYNC"))
+}
+
+/// `CLUSTER SYNCSLOTS CONF <option> <value> [<option> <value> ...]`, which is
+/// each side telling the other something it will need in a moment.
+///
+/// Three of the four options are the node that is talking, a hint about how big a
+/// slot is so the receiving side can size its tables once instead of growing them
+/// all the way up, and a capability word that is ignored on purpose so that a
+/// newer node can say something an older one has never heard of. The fourth is a
+/// master handing its own replicas the state of the migration it is in.
+///
+/// Every complaint here is written rather than returned, because the reference
+/// keeps going after an option it did not understand and still says `OK` at the
+/// end, so one command can answer with both an error line and an `OK`. Returning
+/// would throw the first of those away.
+fn conf(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let mut at = 3;
+    while at < args.len() {
+        if at + 1 >= args.len() {
+            super::write_error(out, &wrong_sub_arity(args.get(1)));
+            return Ok(());
+        }
+        let name = args.get(at);
+        let value = args.get(at + 1);
+        if args::is(name, b"node-id") {
+            // Checked and then dropped, since the only thing that reads it is the
+            // migration this cannot start yet.
+            if value.len() != ID_LEN {
+                let len = value.len();
+                super::write_error(
+                    out,
+                    &Error::fmt(Code::Invalid, format_args!("Invalid node id length {len}")),
+                );
+                return Ok(());
+            }
+            if server.cluster.map.lock().find(value).is_none() {
+                super::write_error(
+                    out,
+                    &Error::fmt(
+                        Code::Invalid,
+                        format_args!(
+                            "Node {} not found in cluster",
+                            String::from_utf8_lossy(value)
+                        ),
+                    ),
+                );
+                return Ok(());
+            }
+        } else if args::is(name, b"slot-info") {
+            if !slot_info(value) {
+                super::write_error(
+                    out,
+                    &Error::fmt(
+                        Code::Invalid,
+                        format_args!("Invalid slot info: {}", String::from_utf8_lossy(value)),
+                    ),
+                );
+                return Ok(());
+            }
+        } else if args::is(name, b"asm-task") {
+            if server.cluster.map.lock().nodes[0].is_master() {
+                super::write_error(
+                    out,
+                    &Error::new(
+                        Code::Invalid,
+                        "CLUSTER SYNCSLOTS CONF ASM-TASK only allowed on replica",
+                    ),
+                );
+                return Ok(());
+            }
+            // A replica that hears this is being told to follow along with a
+            // migration its master is running, and there is nothing here to
+            // follow along with yet, so it says so and carries on with the rest
+            // of the options exactly as the reference does.
+            super::write_error(
+                out,
+                &Error::fmt(
+                    Code::Invalid,
+                    format_args!(
+                        "Failed to handle master task: {}",
+                        String::from_utf8_lossy(value)
+                    ),
+                ),
+            );
+        } else if !args::is(name, b"capa") {
+            super::write_error(
+                out,
+                &Error::fmt(
+                    Code::Invalid,
+                    format_args!("Unknown option {}", String::from_utf8_lossy(name)),
+                ),
+            );
+        }
+        at += 2;
+    }
+    out.ok();
+    Ok(())
+}
+
+/// Whether a `slot-info` value is one, which is `slot:key-count:expire-count`
+/// with all three of them numbers and the first of them a slot.
+///
+/// What it is for is sizing: the node about to receive a slot is being told how
+/// many keys are coming so that it can make room for them in one go. Nothing is
+/// sized on it here, because the tables this engine keeps a slot's keys in grow
+/// without the rehash a size hint exists to avoid, so the value is only checked.
+fn slot_info(value: &[u8]) -> bool {
+    let mut parts = value.split(|b| *b == b':');
+    let Some(slot) = parts.next().and_then(yo_common::num::parse_i64) else {
+        return false;
+    };
+    let Some(keys) = parts.next().and_then(yo_common::num::parse_i64) else {
+        return false;
+    };
+    let Some(expires) = parts.next().and_then(yo_common::num::parse_i64) else {
+        return false;
+    };
+    parts.next().is_none() && (0..SLOTS as i64).contains(&slot) && keys >= 0 && expires >= 0
 }
 
 /// `CLUSTER SETSLOT <slot> IMPORTING|MIGRATING|STABLE|NODE`.
@@ -2358,6 +2659,18 @@ impl Server {
     pub(super) fn cluster_hand_over(&self, slot: u16, node: u16) {
         let mut map = self.cluster.map.lock();
         map.owner[usize::from(slot)] = Some(node);
+    }
+
+    /// Make this node a replica of another one in the table.
+    ///
+    /// What `CLUSTER REPLICATE` does to the table, without the half of it that
+    /// starts replicating, which an embedded server has no way of doing and
+    /// which none of the tests that want a replica in the table care about.
+    pub(super) fn cluster_pretend_follower(&self, of: u16) {
+        let mut map = self.cluster.map.lock();
+        map.nodes[0].flags &= !FLAG_MASTER;
+        map.nodes[0].flags |= FLAG_SLAVE;
+        map.nodes[0].master = Some(of);
     }
 
     /// Mark one slot as on its way out to, or in from, another node.

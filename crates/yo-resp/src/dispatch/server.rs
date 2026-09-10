@@ -380,7 +380,7 @@ pub(super) fn execute(
         "psync" | "sync" => super::repl::psync(server, session, args, out)?,
         "replicaof" | "slaveof" => super::follow::replicaof(server, args, out)?,
         "failover" => super::failover::execute(server, args, out)?,
-        "cluster" => super::cluster::execute(server, session.db, args, out)?,
+        "cluster" => super::cluster::execute(server, session, args, out)?,
         // The three connection commands cluster mode adds. `ASKING` is the one
         // that does anything: it says the next command is allowed into a slot
         // this node is receiving and does not own yet, which is how a client
