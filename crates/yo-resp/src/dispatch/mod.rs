@@ -8141,6 +8141,124 @@ mod tests {
         );
     }
 
+    /// A name is matched without regard to case, in both of the two ways a name
+    /// can be given. This was case sensitive and a real server is not, so
+    /// `CONFIG GET MAXMEMORY` answered nothing at all.
+    ///
+    /// And the name it answers under is the one the client spelled when they
+    /// spelled it out, and its own when they gave a pattern, which is the shape
+    /// of upstream's code rather than a decision it made.
+    #[test]
+    fn a_setting_is_found_whatever_case_it_is_asked_for_in() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"MAXMEMORY"]),
+            "*2\r\n$9\r\nMAXMEMORY\r\n$1\r\n0\r\n"
+        );
+        let starred = f.run(&[b"CONFIG", b"GET", b"MAXMEM*"]);
+        assert!(starred.starts_with("*6\r\n"), "{starred}");
+        assert!(starred.contains("maxmemory"), "{starred}");
+        assert!(!starred.contains("MAXMEM"), "{starred}");
+        // The first argument that matches decides, because upstream has the
+        // setting in its match table by the time it looks at the second.
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"MAXMEMORY", b"maxmemory"]),
+            "*2\r\n$9\r\nMAXMEMORY\r\n$1\r\n0\r\n"
+        );
+        let both = f.run(&[b"CONFIG", b"GET", b"maxmem*", b"MAXMEMORY"]);
+        assert!(both.starts_with("*6\r\n"), "{both}");
+        assert!(!both.contains("MAXMEMORY"), "{both}");
+    }
+
+    /// The four settings a slot migration runs under, two of which a pattern
+    /// finds and two of which only their own name does.
+    #[test]
+    fn the_migration_settings_read_and_write_like_the_reference() {
+        let mut f = Fixture::new();
+        let group = f.run(&[b"CONFIG", b"GET", b"cluster-slot-migration-*"]);
+        assert!(group.starts_with("*4\r\n"), "{group}");
+        assert!(group.contains("handoff-max-lag-bytes"), "{group}");
+        assert!(group.contains("write-pause-timeout"), "{group}");
+        assert!(!group.contains("max-archived-tasks"), "{group}");
+        assert!(!group.contains("sync-buffer-drain-timeout"), "{group}");
+        // Hidden means a pattern does not find it, not that it is not there.
+        assert_eq!(
+            f.run(&[
+                b"CONFIG",
+                b"GET",
+                b"cluster-slot-migration-max-archived-tasks"
+            ]),
+            "*2\r\n$41\r\ncluster-slot-migration-max-archived-tasks\r\n$2\r\n32\r\n"
+        );
+        // The one that counts bytes takes a unit and reads back as a plain
+        // number of bytes, the same way `maxmemory` does.
+        assert_eq!(
+            f.run(&[
+                b"CONFIG",
+                b"SET",
+                b"cluster-slot-migration-handoff-max-lag-bytes",
+                b"2mb"
+            ]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"CONFIG",
+                b"GET",
+                b"cluster-slot-migration-handoff-max-lag-bytes"
+            ]),
+            "*2\r\n$44\r\ncluster-slot-migration-handoff-max-lag-bytes\r\n$7\r\n2097152\r\n"
+        );
+        // And the three that count something else do not take one.
+        assert_eq!(
+            f.run(&[
+                b"CONFIG",
+                b"SET",
+                b"cluster-slot-migration-write-pause-timeout",
+                b"10s"
+            ]),
+            "-ERR CONFIG SET failed (possibly related to argument 'cluster-slot-migration-write-pause-timeout') - argument couldn't be parsed into an integer\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"CONFIG",
+                b"SET",
+                b"cluster-slot-migration-handoff-max-lag-bytes",
+                b"-1"
+            ]),
+            "-ERR CONFIG SET failed (possibly related to argument 'cluster-slot-migration-handoff-max-lag-bytes') - argument must be a memory value\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"CONFIG",
+                b"SET",
+                b"cluster-slot-migration-write-pause-timeout",
+                b"-1"
+            ]),
+            "-ERR CONFIG SET failed (possibly related to argument 'cluster-slot-migration-write-pause-timeout') - argument must be between 0 and 9223372036854775807 inclusive\r\n"
+        );
+        // The archived count is the only one with a ceiling, because it is an
+        // int on the other side and the rest are a long long.
+        assert_eq!(
+            f.run(&[
+                b"CONFIG",
+                b"SET",
+                b"cluster-slot-migration-max-archived-tasks",
+                b"0"
+            ]),
+            "-ERR CONFIG SET failed (possibly related to argument 'cluster-slot-migration-max-archived-tasks') - argument must be between 1 and 2147483647 inclusive\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"CONFIG",
+                b"SET",
+                b"cluster-slot-migration-max-archived-tasks",
+                b"2147483648"
+            ]),
+            "-ERR CONFIG SET failed (possibly related to argument 'cluster-slot-migration-max-archived-tasks') - argument must be between 1 and 2147483647 inclusive\r\n"
+        );
+    }
+
     #[test]
     fn the_eviction_policy_reads_back_what_was_written_to_it() {
         let mut f = Fixture::new();
