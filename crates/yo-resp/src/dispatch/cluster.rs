@@ -57,6 +57,7 @@ use crate::reply::Out;
 use super::args::{self, Args};
 use super::{Server, Session};
 
+mod asm;
 mod bus;
 use super::keyspec;
 use super::table::Spec;
@@ -462,6 +463,8 @@ pub(crate) struct Cluster {
     /// The links, the blacklist and the secret, none of which exist until the
     /// bus is started and none of which a command reads on the hot path.
     bus: bus::Bus,
+    /// The slot migration this node is in, and the ones it has been in.
+    asm: asm::Asm,
 }
 
 impl Default for Cluster {
@@ -482,6 +485,7 @@ impl Default for Cluster {
             reads_when_down: AtomicBool::new(false),
             file: Lock::new(String::new()),
             bus: bus::Bus::default(),
+            asm: asm::Asm::default(),
         }
     }
 }
@@ -1697,9 +1701,9 @@ fn slot_stats(server: &Server, db: usize, args: Args<'_>, out: &mut Out) -> Resu
 /// slot range: the importing node drives the whole move rather than a tool
 /// stepping it key by key.
 ///
-/// Nothing here can start one until the bus is in, so what is implemented is the
-/// argument surface and the two questions that have an answer on a node with no
-/// tasks: nothing is running, so `STATUS` is empty and `CANCEL` cancelled none.
+/// `STATUS` and `CANCEL` report and cancel what is really running, which on this
+/// node is a migration another node started against it. Starting one from here,
+/// which is what `IMPORT` is, is the other side of the protocol and is D-149.
 fn migration(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
     let sub = args.get(1);
     let action = args.get(2);
@@ -1714,10 +1718,14 @@ fn migration(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         if !by_id && args.len() != 4 {
             return Err(wrong_sub_arity(sub));
         }
+        let id = by_id.then(|| args.get(4));
         if args::is(action, b"status") {
-            out.array(0);
+            match id {
+                Some(id) => server.cluster.asm.report_one(id, out),
+                None => server.cluster.asm.report_all(out),
+            }
         } else {
-            out.int(0);
+            out.int(server.cluster.asm.cancel(id, server.now_ms() as i64));
         }
         return Ok(());
     }
@@ -1839,16 +1847,10 @@ fn syncslots(server: &Server, session: &mut Session, args: Args<'_>, out: &mut O
         }
     }
     if args::is(action, b"sync") && args.len() >= 6 {
-        return sync(server, args);
+        return sync(server, session, args, out);
     }
     if args::is(action, b"rdbchannel") && args.len() == 4 {
-        if args.get(3).len() != ID_LEN {
-            return Err(Error::new(Code::Invalid, "Invalid task id"));
-        }
-        return Err(Error::new(
-            Code::Invalid,
-            "No slot migration task in progress",
-        ));
+        return rdbchannel(server, session, args, out);
     }
     if (args::is(action, b"snapshot-eof") || args::is(action, b"stream-eof")) && args.len() == 3 {
         // Both of these say a transfer has ended, and on a node with no transfer
@@ -1867,7 +1869,7 @@ fn syncslots(server: &Server, session: &mut Session, args: Args<'_>, out: &mut O
         return Ok(());
     }
     if args::is(action, b"conf") && args.len() >= 5 {
-        return conf(server, args, out);
+        return conf(server, session, args, out);
     }
     Err(args::syntax())
 }
@@ -1875,10 +1877,14 @@ fn syncslots(server: &Server, session: &mut Session, args: Args<'_>, out: &mut O
 /// `CLUSTER SYNCSLOTS SYNC <task-id> <start> <end> [<start> <end> ...]`, which is
 /// the node taking the slots asking for them.
 ///
-/// Every check the reference makes before it forks is made here, because they
-/// are what a caller reads to find out it asked the wrong node, and only the
-/// part that needs a snapshot to send is missing.
-fn sync(server: &Server, args: Args<'_>) -> Result<()> {
+/// Every check the reference makes before it starts is made here, in its order,
+/// because they are what a caller reads to find out it asked the wrong node.
+///
+/// What comes back on the way through is `+RDBCHANNELSYNCSLOTS`, which is the far
+/// side being told to open the second connection the snapshot will come down.
+/// Nothing else is written to this connection yet: it is the one the changes
+/// since the snapshot would go down, and those are D-149.
+fn sync(server: &Server, session: &mut Session, args: Args<'_>, out: &mut Out) -> Result<()> {
     if !args.len().is_multiple_of(2) {
         return Err(wrong_sub_arity(args.get(1)));
     }
@@ -1915,8 +1921,49 @@ fn sync(server: &Server, args: Args<'_>) -> Result<()> {
                 "This node is not the owner of the slots",
             ));
         }
+        // A node that is not in the table, or that is somebody's replica, has
+        // nowhere to put a slot. The far side only says who it is when it sent
+        // `CONF NODE-ID` first, and the reference lets a connection that did not
+        // through, so this is checked only when there is something to check.
+        let dest = session.node_id().to_vec();
+        if !dest.is_empty()
+            && !map
+                .find(&dest)
+                .is_some_and(|at| map.nodes[at as usize].is_master())
+        {
+            return Err(Error::fmt(
+                Code::Invalid,
+                format_args!(
+                    "Destination node {} is not a master",
+                    String::from_utf8_lossy(&dest)
+                ),
+            ));
+        }
     }
-    Err(not_yet("CLUSTER SYNCSLOTS SYNC"))
+    server.asm_begin_migrate(args.get(3), session.node_id(), ranges, session.row().id)?;
+    out.simple(b"RDBCHANNELSYNCSLOTS");
+    Ok(())
+}
+
+/// `CLUSTER SYNCSLOTS RDBCHANNEL <task-id>`, which is the second connection of a
+/// migration arriving to be handed the snapshot.
+///
+/// The reference answers `+SLOTSSNAPSHOT` and then forks, and the snapshot goes
+/// out of the child while the parent carries on serving. There is no fork here,
+/// so the snapshot is built with every write on the server held off and then
+/// written, which is the same trade a full resync makes and is why the snapshot
+/// is one slot range rather than the whole keyspace.
+fn rdbchannel(server: &Server, session: &mut Session, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let id = args.get(3);
+    if id.len() != ID_LEN {
+        return Err(Error::new(Code::Invalid, "Invalid task id"));
+    }
+    let ranges = server.asm_take_rdb_channel(id, session.row().id)?;
+    out.simple(b"SLOTSSNAPSHOT");
+    let (image, _offset) = server.asm_snapshot(&ranges);
+    out.raw(&image);
+    server.asm_snapshot_sent();
+    Ok(())
 }
 
 /// `CLUSTER SYNCSLOTS CONF <option> <value> [<option> <value> ...]`, which is
@@ -1932,7 +1979,7 @@ fn sync(server: &Server, args: Args<'_>) -> Result<()> {
 /// keeps going after an option it did not understand and still says `OK` at the
 /// end, so one command can answer with both an error line and an `OK`. Returning
 /// would throw the first of those away.
-fn conf(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn conf(server: &Server, session: &mut Session, args: Args<'_>, out: &mut Out) -> Result<()> {
     let mut at = 3;
     while at < args.len() {
         if at + 1 >= args.len() {
@@ -1942,8 +1989,9 @@ fn conf(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let name = args.get(at);
         let value = args.get(at + 1);
         if args::is(name, b"node-id") {
-            // Checked and then dropped, since the only thing that reads it is the
-            // migration this cannot start yet.
+            // Who is on the other end of this connection, which is what the
+            // `SYNC` after it is checked against and what the task it starts
+            // records as the node the slots are going to.
             if value.len() != ID_LEN {
                 let len = value.len();
                 super::write_error(
@@ -1965,6 +2013,7 @@ fn conf(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                 );
                 return Ok(());
             }
+            session.set_node_id(value);
         } else if args::is(name, b"slot-info") {
             if !slot_info(value) {
                 super::write_error(
