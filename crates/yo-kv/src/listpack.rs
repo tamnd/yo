@@ -706,6 +706,29 @@ fn encode<'b>(v: &[u8], buf: &'b mut [u8; 16]) -> (&'b [u8], bool) {
     (head, true)
 }
 
+/// Put a header and a terminator around entries somebody else already encoded.
+///
+/// The reverse of [`Listpack::entries`], and the reason it exists is the RDB.
+/// A list in the chunked band holds its elements in this encoding but not in
+/// this container, and the shape Redis writes a list out in is a listpack per
+/// node, so the writer needs a blob rather than a run. Wrapping is a header, a
+/// copy and a byte, against re-encoding every element.
+///
+/// `count` is the number of entries in `entries`, which the caller always knows
+/// because whatever is holding them counts as it goes.
+pub(crate) fn wrap(entries: &[u8], count: usize, out: &mut Vec<u8>) {
+    let total = HDR + entries.len() + 1;
+    out.extend_from_slice(&(total as u32).to_le_bytes());
+    let said = if count > COUNT_MAX {
+        COUNT_UNKNOWN
+    } else {
+        count as u16
+    };
+    out.extend_from_slice(&said.to_le_bytes());
+    out.extend_from_slice(entries);
+    out.push(END);
+}
+
 /// How many bytes an entry for `v` takes, its back length included.
 ///
 /// The chunk has to know before it writes, because a chunk that runs out of
