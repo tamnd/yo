@@ -23,11 +23,14 @@
 //! `wait-rdbchannel`, gets its snapshot written when the second connection
 //! arrives with `CLUSTER SYNCSLOTS RDBCHANNEL`, and then every write that lands
 //! in the moving slots goes down the first connection behind it until the far
-//! side says it has caught up.
+//! side says it has caught up. Then writes stop, what was already running is
+//! waited out, and the far side is told the stream has ended.
 //!
-//! What is not here is the pause and the handoff, so a migration started against
-//! this node reaches `handoff-prep` and stops there rather than giving the slots
-//! up. That is D-149 and it is the next piece.
+//! What is not here is the last step of all, which is the far side claiming the
+//! slots over the bus and this node dropping the keys it no longer owns. Until
+//! that is written a migration against this node stops at `stream-eof` and gives
+//! up when the write pause runs out, so the slots stay here and nothing is lost.
+//! That is D-149 and it is the next piece.
 //!
 //! # Where the two streams meet
 //!
@@ -54,7 +57,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 
 use yo_common::lock::Lock;
 use yo_common::{Code, Error, Result};
@@ -183,6 +186,9 @@ pub(super) enum State {
     None,
     /// Cancelled, by an operator or by something else needing the slot.
     Canceled,
+    /// Done with, which the snapshot connection is once the snapshot has gone
+    /// out and a whole task is once the slots have changed hands.
+    Completed,
     /// Given up on. The reason is in the task's error.
     Failed,
     /// The far side has asked for the slots and the second connection it will
@@ -195,6 +201,11 @@ pub(super) enum State {
     /// The far side is within a hair of caught up, so the next thing to happen
     /// is writes stopping and the slots changing hands.
     HandoffPrep,
+    /// Writes have stopped and what was already running is being waited out.
+    Handoff,
+    /// Nothing more is coming and the far side has been told so. All that is
+    /// left is for it to claim the slots.
+    StreamEof,
     /// What the far side calls itself while it is working through the changes
     /// that piled up behind the snapshot. Only ever set as the other end's
     /// state, never as this node's own.
@@ -210,11 +221,14 @@ impl State {
         match self {
             State::None => "none",
             State::Canceled => "canceled",
+            State::Completed => "completed",
             State::Failed => "failed",
             State::WaitRdbChannel => "wait-rdbchannel",
             State::WaitBgsaveStart => "wait-bgsave-start",
             State::SendStream => "send-stream",
             State::HandoffPrep => "handoff-prep",
+            State::Handoff => "handoff",
+            State::StreamEof => "stream-eof",
             State::StreamingBuf => "streaming-buffer",
             State::WaitStreamEof => "wait-stream-eof",
         }
@@ -235,8 +249,20 @@ impl State {
     }
 
     /// Whether a migration in this state is still sending changes.
+    ///
+    /// `handoff` is one of them, and that is the whole point of the state: the
+    /// writes that were already running when the pause went on still have to be
+    /// sent, or the far side takes the slots missing them.
     fn streaming(self) -> bool {
-        matches!(self, State::SendStream | State::HandoffPrep)
+        matches!(
+            self,
+            State::SendStream | State::HandoffPrep | State::Handoff
+        )
+    }
+
+    /// Whether writes are stopped while this state lasts.
+    fn pausing(self) -> bool {
+        matches!(self, State::Handoff | State::StreamEof)
     }
 }
 
@@ -287,6 +313,16 @@ pub(super) struct Task {
     acked: u64,
     /// What the far side said it was doing when it last acknowledged.
     dest_state: State,
+    /// Where the snapshot connection has got to, which only a failure message
+    /// ever reads. `none` until the snapshot has been asked for and `completed`
+    /// once it has gone out.
+    ///
+    /// The reference has a state between the two for a snapshot being written,
+    /// and here there is no such moment: the snapshot is built in one go behind
+    /// a freeze, so it has either not started or finished.
+    rdb_state: State,
+    /// When writes stopped for the handoff, or nought if they have not.
+    paused: i64,
 }
 
 impl Task {
@@ -332,23 +368,36 @@ impl Task {
         out.int(self.started);
         out.bulk(b"end_time");
         out.int(self.ended);
-        // The reference only reports a pause for a migration that finished, and
-        // nothing here pauses anything yet, so it is always nought.
+        // How long writes were stopped for, which the reference only reports for
+        // a migration that got all the way through. One that is still running or
+        // that gave up says nought however long it held the server, because the
+        // number is there to be read after the fact and a running one has no
+        // total yet. Nothing reaches `completed` until the slots can change
+        // hands, so today this is always nought and the rule is here rather than
+        // the number.
         out.bulk(b"write_pause_ms");
-        out.int(0);
+        out.int(if self.import || self.state != State::Completed {
+            0
+        } else {
+            self.ended - self.paused
+        });
     }
 
     /// Say why this task stopped, in the reference's sentence.
     ///
     /// The two states it names are the task's own and the snapshot connection's,
-    /// and both of them are read after the state has already moved, which is why
-    /// the caller sets the state first and says why second.
+    /// and the first of them is the state the task was in when it went wrong
+    /// rather than the one it is about to move to. That is what the reference
+    /// reports, because it builds the sentence before it changes the state, and
+    /// it is the more useful of the two: knowing a cancelled task is cancelled
+    /// says nothing, knowing it was halfway through a snapshot says everything.
+    /// So every caller says why first and moves the state second.
     fn blame(&mut self, why: &str) {
         self.error = yo_alloc::allow(|| {
             format!(
                 "{why} (state: {}, rdb_channel_state: {})",
                 self.state.word(),
-                State::None.word()
+                self.rdb_state.word()
             )
         });
     }
@@ -372,6 +421,12 @@ pub(super) struct Asm {
     /// them nearly all of the time, the answer is no and the lock would be a
     /// contended one on the hot path for nothing.
     streaming: AtomicBool,
+    /// The deadline of the write pause a handoff armed, or nought for none.
+    ///
+    /// Kept because the server has one pause and several things can arm it, so
+    /// lifting this one has to be able to say which one it is lifting and leave
+    /// anybody else's alone.
+    armed: AtomicU64,
 }
 
 /// The live task and the ones that have finished, newest first.
@@ -434,8 +489,8 @@ impl Asm {
         if id.is_some_and(|want| task.id.as_bytes() != want) {
             return 0;
         }
-        task.state = State::Canceled;
         task.blame("Cancelled due to user request");
+        task.state = State::Canceled;
         self.retire(&mut tasks, now);
         1
     }
@@ -457,6 +512,10 @@ impl Asm {
             && task.state == State::WaitBgsaveStart
         {
             task.state = State::SendStream;
+            // The snapshot has been read by the time this runs and there is no
+            // moment at which it is half sent, so the connection it goes down is
+            // done with as far as anything that reads this is concerned.
+            task.rdb_state = State::Completed;
             self.streaming.store(true, Relaxed);
         }
     }
@@ -473,8 +532,8 @@ impl Asm {
         let Some(task) = tasks.live.as_mut() else {
             return;
         };
-        task.state = State::Canceled;
         task.blame("Cancelled due to propagating cross slot command");
+        task.state = State::Canceled;
         self.retire(&mut tasks, now);
     }
 
@@ -493,10 +552,10 @@ impl Asm {
             return;
         }
         let which = if main { "Main" } else { "RDB" };
-        task.state = State::Failed;
         task.blame(&yo_alloc::allow(|| {
             format!("{which} channel - Connection with the peer node was lost")
         }));
+        task.state = State::Failed;
         self.retire(&mut tasks, now);
     }
 
@@ -507,16 +566,18 @@ impl Asm {
     /// reply on it would be read as a command.
     ///
     /// Once the far side is within `cluster-slot-migration-handoff-max-lag-bytes`
-    /// of everything that has been sent, the task moves to `handoff-prep`, which
-    /// is the point at which writes would stop. Stopping them is D-149, so for
-    /// now it says so and waits.
-    fn ack(&self, conn: u64, state: State, offset: u64) {
+    /// of everything that has been sent, the task moves to `handoff-prep` and
+    /// the answer is true, which is the caller's cue to stop writes and hand the
+    /// slots over. That is done outside this lock because it freezes the server
+    /// and holding a lock the status command wants across a freeze would mean
+    /// nobody could even ask what the migration was doing.
+    fn ack(&self, conn: u64, state: State, offset: u64) -> bool {
         let mut tasks = self.inner.lock();
         let Some(task) = tasks.live.as_mut() else {
-            return;
+            return false;
         };
         if task.import || !task.main.as_ref().is_some_and(|row| row.id == conn) {
-            return;
+            return false;
         }
         task.dest_state = state;
         // Backwards is not an error and not a state to act on. The reference
@@ -524,13 +585,89 @@ impl Asm {
         // its count again is a thing that happens and the older number is simply
         // stale.
         if offset < task.acked {
-            return;
+            return false;
         }
         task.acked = offset;
         let lag = self.knobs.lag.load(Relaxed).max(0) as u64;
         if task.state == State::SendStream && task.acked + lag >= task.sent {
             task.state = State::HandoffPrep;
+            return true;
         }
+        false
+    }
+
+    /// Note that writes have stopped, and say whether they stopped for this.
+    ///
+    /// False means the task moved on between the acknowledgement and here, which
+    /// a cancel arriving at the wrong moment does, and then the pause is not
+    /// armed at all rather than armed with nothing left to lift it.
+    fn begin_handoff(&self, now: i64, until: u64) -> bool {
+        let mut tasks = self.inner.lock();
+        let Some(task) = tasks.live.as_mut() else {
+            return false;
+        };
+        if task.state != State::HandoffPrep {
+            return false;
+        }
+        task.state = State::Handoff;
+        task.paused = now;
+        self.armed.store(until, Relaxed);
+        true
+    }
+
+    /// Tell the far side there is no more coming, and stop sending.
+    ///
+    /// Run inside the freeze, which is what makes the end of the stream an
+    /// instant rather than a guess. The reference watches the socket empty out
+    /// instead, because it has one thread and a write that got as far as the
+    /// buffer is a write that is already accounted for. Here a write on another
+    /// thread can still be running when the pause goes on, so what is waited for
+    /// is the write itself and not the bytes it will produce, and the freeze is
+    /// the same barrier the snapshot is taken behind.
+    ///
+    /// The connection is let go of rather than closed. The far side closes it
+    /// once it has read the last of the stream, and letting go here is what
+    /// keeps that from being read as the connection dropping under a live task.
+    fn end_stream(&self) -> Option<Arc<Client>> {
+        let mut tasks = self.inner.lock();
+        let task = tasks.live.as_mut()?;
+        if task.state != State::Handoff {
+            return None;
+        }
+        task.state = State::StreamEof;
+        self.streaming.store(false, Relaxed);
+        task.rdb = None;
+        task.main.take()
+    }
+
+    /// Give up on a handoff the far side never finished, which is the reference's
+    /// `cluster-slot-migration-write-pause-timeout`.
+    ///
+    /// The slots stay here and the keys stay here. Everything the far side built
+    /// is its to throw away, and it finds out either from the connection ending
+    /// or from the slots never moving.
+    fn pause_expired(&self, now: i64, timeout: i64) -> bool {
+        let mut tasks = self.inner.lock();
+        let Some(task) = tasks.live.as_mut() else {
+            return false;
+        };
+        if !task.state.pausing() || now - task.paused < timeout {
+            return false;
+        }
+        task.blame(&yo_alloc::allow(|| {
+            format!(
+                "Write pause timeout during slot handoff: destination did not take ownership within {timeout} ms."
+            )
+        }));
+        task.state = State::Failed;
+        self.retire(&mut tasks, now);
+        true
+    }
+
+    /// Whether a live task is holding the write pause on.
+    fn pausing(&self) -> bool {
+        let tasks = self.inner.lock();
+        tasks.live.as_ref().is_some_and(|task| task.state.pausing())
     }
 }
 
@@ -542,6 +679,7 @@ impl Server {
     /// carrying a migration.
     pub(crate) fn asm_forget(&self, conn: u64) {
         self.cluster.asm.forget(conn, self.now_ms() as i64);
+        self.asm_relax();
     }
 
     /// Start a migration off this node, which is `CLUSTER SYNCSLOTS SYNC`.
@@ -591,8 +729,8 @@ impl Server {
                 .live
                 .as_mut()
                 .expect("there is one, or replace is not set");
-            live.state = State::Canceled;
             live.blame("Cancelled due to new migration requested");
+            live.state = State::Canceled;
             self.cluster.asm.retire(&mut tasks, now);
         }
         tasks.live = Some(Task {
@@ -612,6 +750,8 @@ impl Server {
             sent: 0,
             acked: 0,
             dest_state: State::None,
+            paused: 0,
+            rdb_state: State::None,
         });
         Ok(())
     }
@@ -731,25 +871,29 @@ impl Server {
         let Some(slot) = slot else {
             return;
         };
-        let target = {
-            let mut tasks = self.cluster.asm.inner.lock();
-            let Some(task) = tasks.live.as_mut() else {
-                return;
-            };
-            if task.import || !task.state.streaming() {
-                return;
-            }
-            if !task
-                .slots
-                .iter()
-                .any(|(from, to)| (*from..=*to).contains(&slot))
-            {
-                return;
-            }
-            task.sent += wire.len() as u64;
-            task.main.clone()
+        // Handed over while the task is held, which is what puts the stream in
+        // one order. Two threads writing two keys of the same slot at the same
+        // time both get here, and whichever of them counts its bytes first is
+        // the one whose command goes first, rather than the two racing between
+        // the counting and the handing over and arriving the wrong way round.
+        // It is also what lets the end of the stream be written with nothing
+        // able to slip in behind it.
+        let mut tasks = self.cluster.asm.inner.lock();
+        let Some(task) = tasks.live.as_mut() else {
+            return;
         };
-        let Some(row) = target else {
+        if task.import || !task.state.streaming() {
+            return;
+        }
+        if !task
+            .slots
+            .iter()
+            .any(|(from, to)| (*from..=*to).contains(&slot))
+        {
+            return;
+        }
+        task.sent += wire.len() as u64;
+        let Some(row) = task.main.clone() else {
             return;
         };
         let shared = yo_alloc::allow(|| Arc::new(wire.to_vec()));
@@ -761,9 +905,81 @@ impl Server {
 
     /// Take an acknowledgement from the node the slots are going to.
     pub(super) fn asm_ack(&self, conn: u64, state: &[u8], offset: u64) {
-        if let Some(state) = State::dest_word(state) {
-            self.cluster.asm.ack(conn, state, offset);
+        let Some(state) = State::dest_word(state) else {
+            return;
+        };
+        if self.cluster.asm.ack(conn, state, offset) {
+            self.asm_handoff();
         }
+    }
+
+    /// Stop taking writes and close the stream, which is the handoff.
+    ///
+    /// Three steps in an order that matters. Writes stop first, so that nothing
+    /// new can land in a slot that is about to belong to somebody else. Then the
+    /// server is frozen, which waits out the writes that were already running
+    /// and were let through before the pause; their changes go down the stream
+    /// like any others because the task is still in a state that sends them.
+    /// Only then is the end of the stream written, and by then there is nothing
+    /// that could come after it.
+    ///
+    /// The pause has a deadline of its own as well as being lifted by hand. If
+    /// this node is left holding it because the far side went away in the wrong
+    /// half second, it lets go on its own at the same moment the cron gives up
+    /// on the task, and a server that stops taking writes forever is not a thing
+    /// a bug in here should be able to produce.
+    fn asm_handoff(&self) {
+        let now = self.now_ms();
+        let timeout = self.migration_knob(Migration::Pause).max(0) as u64;
+        let until = now.saturating_add(timeout);
+        if !self.cluster.asm.begin_handoff(now as i64, until) {
+            return;
+        }
+        self.pause(until, false);
+        let done = self.at_an_instant(|| self.cluster.asm.end_stream()).0;
+        let Some(row) = done else {
+            return;
+        };
+        let mut out = Out::with_capacity(Proto::Resp2, 64);
+        out.array(3);
+        out.bulk(b"CLUSTER");
+        out.bulk(b"SYNCSLOTS");
+        out.bulk(b"STREAM-EOF");
+        let shared = yo_alloc::allow(|| Arc::new(out.into_inner()));
+        self.post(
+            row.thread.load(Relaxed),
+            Envelope::raw(row.conn.load(Relaxed), row.id, shared),
+        );
+    }
+
+    /// The migration's share of the cluster's clock.
+    ///
+    /// One thing so far: a handoff that has held the server for longer than it
+    /// is allowed to is given up on. The far side is not told, because the only
+    /// connection to it is the one it is expected to close.
+    pub(crate) fn asm_cron(&self) {
+        let timeout = self.migration_knob(Migration::Pause).max(0);
+        if self
+            .cluster
+            .asm
+            .pause_expired(self.now_ms() as i64, timeout)
+        {
+            self.asm_relax();
+        }
+    }
+
+    /// Let writes go again if the handoff that stopped them is over.
+    ///
+    /// Called wherever a task can end, and once a tick besides, because a task
+    /// ends down several paths and the one that must not happen is a server left
+    /// paused by a migration that is no longer running.
+    pub(crate) fn asm_relax(&self) {
+        let armed = self.cluster.asm.armed.load(Relaxed);
+        if armed == 0 || self.cluster.asm.pausing() {
+            return;
+        }
+        self.cluster.asm.armed.store(0, Relaxed);
+        self.lift(armed, false);
     }
 
     /// Read one of the `cluster-slot-migration-*` settings.
@@ -1141,13 +1357,20 @@ mod tests {
         server.cluster.asm.report_one(&[b'b'; 40], &mut out);
         let got = text(&out);
         assert!(got.contains("canceled"), "{got:?}");
-        assert!(got.contains("propagating cross slot command"), "{got:?}");
+        // The states in the sentence are the ones it was in when it went wrong,
+        // not the ones it moved to because it did.
+        assert!(
+            got.contains(
+                "Cancelled due to propagating cross slot command (state: send-stream, rdb_channel_state: completed)"
+            ),
+            "{got:?}"
+        );
     }
 
     /// The far side saying how far it has got is what moves the task on to the
     /// point where writes would stop.
     #[test]
-    fn catching_up_moves_the_task_to_handoff_prep() {
+    fn catching_up_stops_the_writes_and_ends_the_stream() {
         let server = node();
         let id = [b'b'; 40];
         server
@@ -1175,16 +1398,98 @@ mod tests {
             server.cluster.asm.inner.lock().live.as_ref().unwrap().acked,
             LAG
         );
-        // And within a megabyte is close enough.
+        // And within a megabyte is close enough, which stops the writes and ends
+        // the stream in one go.
         server.asm_ack(7, b"wait-stream-eof", LAG * 3);
-        assert_eq!(state(&server), State::HandoffPrep);
-        // Which is still a state that takes the changes still arriving.
-        let write = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$1\r\nx\r\n";
-        server.asm_feed(write);
+        assert_eq!(state(&server), State::StreamEof);
+        assert_eq!(server.paused(server.now_ms()), Some(false), "writes only");
+        assert!(!server.propagating(), "nothing more is sent");
+        // The connection is let go of rather than closed, so the far side
+        // hanging up on it afterwards is not read as a migration falling over.
+        assert!(
+            server
+                .cluster
+                .asm
+                .inner
+                .lock()
+                .live
+                .as_ref()
+                .unwrap()
+                .main
+                .is_none()
+        );
+        server.asm_forget(7);
+        assert_eq!(state(&server), State::StreamEof);
+        // And nothing that arrives late is counted, because nothing is listening
+        // for it any more.
+        server.asm_feed(b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$1\r\nx\r\n");
         assert_eq!(
             server.cluster.asm.inner.lock().live.as_ref().unwrap().sent,
-            LAG * 4 + write.len() as u64
+            LAG * 4
         );
+    }
+
+    /// A far side that never takes the slots does not get to hold this server
+    /// shut forever.
+    #[test]
+    fn a_handoff_the_far_side_never_finishes_gives_up() {
+        let server = node();
+        let id = [b'b'; 40];
+        server
+            .asm_begin_migrate(&id, &[b'c'; 40], vec![(0, 16383)], &wire(7))
+            .expect("nothing else is running");
+        server
+            .asm_take_rdb_channel(&id, 8)
+            .expect("the task is waiting for it");
+        server.asm_snapshot(&[(0, 16383)]);
+        server.asm_ack(7, b"wait-stream-eof", 0);
+        assert_eq!(server.paused(server.now_ms()), Some(false));
+        // Nothing has taken too long yet.
+        server.asm_cron();
+        assert_eq!(server.paused(server.now_ms()), Some(false));
+        // Now it has. The task fails and the pause goes with it.
+        {
+            let mut tasks = server.cluster.asm.inner.lock();
+            let task = tasks.live.as_mut().unwrap();
+            task.paused -= super::WRITE_PAUSE + 1;
+        }
+        server.asm_cron();
+        assert_eq!(server.paused(server.now_ms()), None);
+        let mut out = Out::new(Proto::Resp3);
+        server.cluster.asm.report_one(&id, &mut out);
+        let got = text(&out);
+        assert!(
+            got.contains(
+                "Write pause timeout during slot handoff: destination did not take ownership within 10000 ms. (state: stream-eof, rdb_channel_state: completed)"
+            ),
+            "{got:?}"
+        );
+        // A migration that failed reports no pause, however long it held the
+        // server, because the number is only for one that got through.
+        assert!(got.contains("write_pause_ms\r\n:0\r\n"), "{got:?}");
+    }
+
+    /// Cancelling a migration that has stopped the writes starts them again,
+    /// and does not touch a pause somebody else put on.
+    #[test]
+    fn cancelling_a_handoff_lets_the_writes_go() {
+        let server = node();
+        let id = [b'b'; 40];
+        server
+            .asm_begin_migrate(&id, &[b'c'; 40], vec![(0, 16383)], &wire(7))
+            .expect("nothing else is running");
+        server
+            .asm_take_rdb_channel(&id, 8)
+            .expect("the task is waiting for it");
+        server.asm_snapshot(&[(0, 16383)]);
+        server.asm_ack(7, b"wait-stream-eof", 0);
+        assert_eq!(server.paused(server.now_ms()), Some(false));
+        assert_eq!(
+            server.cluster.asm.cancel(Some(&id), server.now_ms() as i64),
+            1
+        );
+        server.asm_relax();
+        assert_eq!(server.paused(server.now_ms()), None);
     }
 
     /// One at a time, because two moves at once would each be pausing writes

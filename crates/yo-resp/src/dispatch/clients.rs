@@ -454,6 +454,18 @@ impl super::Server {
         self.pause.store(keep, Release);
     }
 
+    /// Undo one particular pause, and only that one.
+    ///
+    /// The caller says what it armed, and if that is still exactly what is armed
+    /// then it goes and if it is not then nothing happens. Widening is the whole
+    /// reason: two pauses that overlap are one word, and the second one to be
+    /// lifted must not take the first one with it. Anything an operator asked
+    /// for is left to [`Self::unpause`], which is what `CLIENT UNPAUSE` is.
+    pub fn lift(&self, until_ms: u64, all: bool) {
+        let word = (until_ms.min(u64::MAX >> 1) << 1) | u64::from(all);
+        let _ = self.pause.compare_exchange(word, 0, Release, Relaxed);
+    }
+
     /// Whether commands are being held right now, and whether that is all of
     /// them.
     ///
