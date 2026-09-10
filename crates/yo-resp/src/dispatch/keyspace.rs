@@ -248,7 +248,11 @@ pub(super) fn execute<'a>(
                 None => out.nil(),
             }
         }
-        "restore" => restore(db, at, args, out, touched)?,
+        // The second spelling is the one a cluster node's `MIGRATE` sends. It is
+        // the same command and the difference is entirely in the routing gate,
+        // which lets it into a slot this node is importing without the
+        // connection having said `ASKING` first.
+        "restore" | "restore-asking" => restore(db, at, args, out, touched)?,
         // Every stripe and not one, and the stripe is drawn first so that the
         // key is still drawn from the database rather than from whichever
         // stripe happened to be asked. See [`Db::random_key`].

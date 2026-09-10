@@ -2923,7 +2923,13 @@ pub fn resolved(
     // replica that stopped following.
     if server.cluster_enabled()
         && !session.serving_master()
-        && let Some(said) = cluster::gate(server, session.db, session.asking, spec, args)
+        && let Some(said) = cluster::gate(
+            server,
+            session.db,
+            session.asking || cluster::asks(spec),
+            spec,
+            args,
+        )
     {
         server.mine().cmdstats.at(spec).rejected.bump();
         if spec.name == "exec" {
@@ -3228,7 +3234,11 @@ pub fn resolved(
             // that reaches back into the server afterwards, and it hands back a list
             // rather than one answer, because `DEL a b c` is three keys and a rename
             // is two.
-            "keyspace" => {
+            // `RESTORE-ASKING` is `RESTORE` with an `ASKING` built into it and
+            // runs the same body, but the reference files it under the server
+            // group rather than the keyspace one, so it has to be named here to
+            // reach the arm below.
+            "keyspace" | "server" if spec.group == "keyspace" || spec.name == "restore-asking" => {
                 let mut touched = indexing::Touched::new(server);
                 let done =
                     keyspace::execute(&server.dbs, session.db, spec, args, out, &mut touched);
@@ -32444,6 +32454,128 @@ mod tests {
         assert_eq!(f.run(&[b"SET", b"foo", b"1"]), "+OK\r\n");
         // And it is spent, so the next one is a redirection again.
         assert_eq!(f.run(&[b"GET", b"foo"]), moved);
+    }
+
+    /// `RESTORE-ASKING` carries its own `ASKING`, which is the whole reason it
+    /// exists: the node being sent a slot's keys does not own the slot yet, so a
+    /// plain `RESTORE` would come back as a redirection to the node sending
+    /// them and the migration would never get off the ground.
+    #[test]
+    fn restore_asking_gets_into_an_importing_slot_on_its_own() {
+        let mut f = clustered();
+        f.server.cluster_hand_over(FOO, 1);
+        f.server.cluster_moving(FOO, None, Some(1));
+        // The payload is whatever `DUMP` makes of a one byte string, taken from
+        // this server so the footer is this server's.
+        f.run(&[b"SET", b"scratch", b"1"]);
+        let dumped = f.raw(&[b"DUMP", b"scratch"]);
+        let payload =
+            &dumped[dumped.iter().position(|b| *b == b'\n').unwrap() + 1..dumped.len() - 2];
+        let payload = payload.to_vec();
+        // The ordinary spelling is turned away.
+        assert_eq!(
+            f.run(&[b"RESTORE", b"foo", b"0", &payload]),
+            format!("-MOVED {FOO} 10.0.0.9:7002\r\n")
+        );
+        // And the one migration uses is not.
+        assert_eq!(
+            f.run(&[b"RESTORE-ASKING", b"foo", b"0", &payload]),
+            "+OK\r\n"
+        );
+        // It is not a connection wide permission either, so the next ordinary
+        // command is redirected the same as before.
+        assert_eq!(
+            f.run(&[b"GET", b"foo"]),
+            format!("-MOVED {FOO} 10.0.0.9:7002\r\n")
+        );
+    }
+
+    /// The end of a slot import takes an epoch above everybody else's, which is
+    /// the only thing that makes the rest of the cluster stop pointing clients
+    /// at the node the slot came from.
+    #[test]
+    fn closing_an_import_takes_a_higher_epoch() {
+        let mut f = clustered();
+        f.server.cluster_hand_over(FOO, 1);
+        f.server.cluster_moving(FOO, None, Some(1));
+        let me = f.run(&[b"CLUSTER", b"MYID"]);
+        let me = me[me.find("\r\n").unwrap() + 2..me.len() - 2].to_owned();
+        assert_eq!(
+            f.run(&[
+                b"CLUSTER",
+                b"SETSLOT",
+                FOO.to_string().as_bytes(),
+                b"NODE",
+                me.as_bytes()
+            ]),
+            "+OK\r\n"
+        );
+        // The epoch moved on its own, so a bump asked for now has nothing left
+        // to outrank and says so.
+        assert_eq!(f.run(&[b"CLUSTER", b"BUMPEPOCH"]), "+STILL 1\r\n");
+        // And the slot is this node's with nothing left marked.
+        assert_eq!(f.run(&[b"GET", b"foo"]), "$-1\r\n");
+    }
+
+    /// And a slot handed over without an import behind it does not, because
+    /// nothing has been taken off anybody and there is nothing to outrank.
+    #[test]
+    fn a_plain_hand_over_does_not_touch_the_epoch() {
+        let mut f = clustered();
+        let me = f.run(&[b"CLUSTER", b"MYID"]);
+        let me = me[me.find("\r\n").unwrap() + 2..me.len() - 2].to_owned();
+        assert_eq!(
+            f.run(&[
+                b"CLUSTER",
+                b"SETSLOT",
+                FOO.to_string().as_bytes(),
+                b"NODE",
+                me.as_bytes()
+            ]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"BUMPEPOCH"]),
+            "+BUMPED 1\r\n",
+            "the epoch was still zero, so this is the first thing to move it"
+        );
+    }
+
+    /// A slot is not handed to somebody else while this node still holds keys
+    /// for it, because that would leave two nodes answering for the same data.
+    #[test]
+    fn a_slot_with_keys_in_it_is_not_handed_over() {
+        let mut f = clustered();
+        f.run(&[b"SET", b"foo", b"1"]);
+        let them = b"5b1e2ce29b1e0c86bd53ee1e5b0dd7b66c0e6e0f";
+        assert_eq!(
+            f.run(&[
+                b"CLUSTER",
+                b"SETSLOT",
+                FOO.to_string().as_bytes(),
+                b"NODE",
+                them
+            ]),
+            format!(
+                "-ERR Can't assign hashslot {FOO} to a different node while I still hold keys for this hash slot.\r\n"
+            )
+        );
+        // With the key gone it goes through.
+        f.run(&[b"DEL", b"foo"]);
+        assert_eq!(
+            f.run(&[
+                b"CLUSTER",
+                b"SETSLOT",
+                FOO.to_string().as_bytes(),
+                b"NODE",
+                them
+            ]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"GET", b"foo"]),
+            format!("-MOVED {FOO} 10.0.0.9:7002\r\n")
+        );
     }
 
     /// A transaction is refused at queue time rather than at `EXEC`, so a client
