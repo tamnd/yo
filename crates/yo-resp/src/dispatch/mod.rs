@@ -2373,6 +2373,14 @@ pub struct Session {
     /// that is not a node. The refusal on its own would be enough to be correct
     /// and the hang up is what makes it expensive to sit there guessing.
     closing: bool,
+    /// Which node is on the other end of this connection, empty until one says.
+    ///
+    /// Only a node ever says, with `CLUSTER SYNCSLOTS CONF NODE-ID`, and the only
+    /// thing that reads it is the slot migration that follows on the same
+    /// connection: the node asking for a slot range is the node the range is
+    /// going to, and there is nothing else on the connection that says who that
+    /// is. See the `cluster` module.
+    node_id: Vec<u8>,
 }
 
 /// What a connection has asked to hear back, which is `CLIENT REPLY`.
@@ -2422,6 +2430,7 @@ impl Session {
             asking_next: false,
             internal: false,
             closing: false,
+            node_id: Vec::new(),
             acl: Box::default(),
         }
     }
@@ -2474,6 +2483,20 @@ impl Session {
     #[must_use]
     pub(crate) fn internal(&self) -> bool {
         self.internal || self.master
+    }
+
+    /// Say which node is on the other end, which only a node ever does.
+    pub(crate) fn set_node_id(&mut self, id: &[u8]) {
+        yo_alloc::allow(|| {
+            self.node_id.clear();
+            self.node_id.extend_from_slice(id);
+        });
+    }
+
+    /// Which node is on the other end, empty for every connection a client made.
+    #[must_use]
+    pub(crate) fn node_id(&self) -> &[u8] {
+        &self.node_id
     }
 
     /// Ask that the socket goes once the reply being written has gone out.
@@ -2780,6 +2803,12 @@ pub fn forget_session(server: &Server, session: &mut Session) {
     }
     if session.replicating() {
         server.drop_replica(session.row().id);
+    }
+    // A slot migration this connection was one of the two halves of cannot go on
+    // without it, and half a slot range on the far side is the one outcome
+    // nobody may be left with.
+    if session.internal() {
+        server.asm_forget(session.row().id);
     }
 }
 
@@ -32810,9 +32839,15 @@ mod tests {
             f.run(&sync(id, &[b"1", b"2", b"2", b"3"])),
             "-ERR Slot 2 specified multiple times\r\n"
         );
+        // Ranges it can serve get the task and the invitation to open the second
+        // connection, which is the whole of what the far side is waiting on.
         assert_eq!(
             f.run(&sync(id, &[b"1", b"2", b"3", b"4"])),
-            "-ERR CLUSTER SYNCSLOTS SYNC is not implemented yet, move the slot with SETSLOT and MIGRATE\r\n"
+            "+RDBCHANNELSYNCSLOTS\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"MIGRATION", b"CANCEL", b"ALL"]),
+            ":1\r\n"
         );
         // A slot somebody else owns is not this node's to send.
         f.server.cluster_hand_over(BAR, 1);
@@ -32831,6 +32866,83 @@ mod tests {
         assert_eq!(
             f.run(&sync(id, &[b"1", b"2"])),
             "-ERR all slot states must be STABLE to start a slot migration task.\r\n"
+        );
+    }
+
+    /// The whole of the giving up side, over the wire, in the order the node
+    /// taking the slots does it.
+    ///
+    /// The two connections are one here, which the real protocol never does and
+    /// nothing in the dispatch layer cares about: what is being read is that the
+    /// task is created, that the second request is what releases the snapshot,
+    /// and that the snapshot holds the slots asked for and nothing else.
+    #[test]
+    fn a_sync_and_an_rdbchannel_hand_over_the_slots_asked_for() {
+        let mut f = clustered();
+        f.run(&[b"DEBUG", b"MARK-INTERNAL-CLIENT"]);
+        f.run(&[b"SET", b"foo", b"in the range"]);
+        f.run(&[b"SET", b"bar", b"outside it"]);
+        let id = b"5b1e2ce29b1e0c86bd53ee1e5b0dd7b66c0e6e0f";
+        let foo = FOO.to_string();
+        let foo = foo.as_bytes();
+
+        // Nothing running, so nothing to report and nothing to cancel.
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"MIGRATION", b"STATUS", b"ALL"]),
+            "*0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"MIGRATION", b"CANCEL", b"ALL"]),
+            ":0\r\n"
+        );
+
+        // The snapshot connection cannot come first, because there is no task
+        // for it to belong to.
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"SYNCSLOTS", b"RDBCHANNEL", id]),
+            "-ERR No slot migration task in progress\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"SYNCSLOTS", b"SYNC", id, foo, foo]),
+            "+RDBCHANNELSYNCSLOTS\r\n"
+        );
+        // Which is a task, waiting for exactly that connection.
+        let status = f.run(&[b"CLUSTER", b"MIGRATION", b"STATUS", b"ALL"]);
+        assert!(status.starts_with("*1\r\n"), "{status:?}");
+        assert!(status.contains("wait-rdbchannel"), "{status:?}");
+        assert!(status.contains("migrate"), "{status:?}");
+        // And one at a time, whoever asks.
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"SYNCSLOTS", b"SYNC", id, foo, foo]),
+            "-ERR Another ASM task is already in progress\r\n"
+        );
+
+        let snapshot = f.raw(&[b"CLUSTER", b"SYNCSLOTS", b"RDBCHANNEL", id]);
+        let text = String::from_utf8_lossy(&snapshot);
+        assert!(text.starts_with("+SLOTSSNAPSHOT\r\n"), "{text:?}");
+        assert!(text.contains("$8\r\nFUNCTION\r\n"), "{text:?}");
+        assert!(
+            text.contains("$3\r\nSET\r\n$3\r\nfoo\r\n$12\r\nin the range\r\n"),
+            "{text:?}"
+        );
+        assert!(!text.contains("$3\r\nbar\r\n"), "{text:?}");
+        assert!(
+            text.ends_with("$7\r\nCLUSTER\r\n$9\r\nSYNCSLOTS\r\n$12\r\nSNAPSHOT-EOF\r\n"),
+            "{text:?}"
+        );
+        // The snapshot has gone, so what is left is the stream behind it.
+        let status = f.run(&[b"CLUSTER", b"MIGRATION", b"STATUS", b"ID", id]);
+        assert!(status.contains("send-stream"), "{status:?}");
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"MIGRATION", b"CANCEL", b"ID", id]),
+            ":1\r\n"
+        );
+        // Cancelled and kept, so an operator can still ask what happened.
+        let status = f.run(&[b"CLUSTER", b"MIGRATION", b"STATUS", b"ID", id]);
+        assert!(status.contains("canceled"), "{status:?}");
+        assert!(
+            status.contains("Cancelled due to user request"),
+            "{status:?}"
         );
     }
 

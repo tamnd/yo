@@ -585,6 +585,19 @@ impl Server {
     /// offset and never both. See the module header for why there is no fork to
     /// get this for free.
     pub(crate) fn snapshot_at_an_instant(&self) -> (Vec<u8>, u64) {
+        self.at_an_instant(|| super::persist::build(self).0)
+    }
+
+    /// Run `f` with nothing writing, and say which offset it ran at.
+    ///
+    /// The freeze is the whole of how this server gets what a real one gets from
+    /// a fork: whatever `f` reads is one moment of the dataset, and the offset
+    /// that comes back is the point in the stream that moment sits at, so a
+    /// caller feeding a replica knows exactly where to carry on from.
+    ///
+    /// Every write is held off for as long as `f` runs, so `f` has to be worth
+    /// it. Building a whole image is; anything that waits on a client is not.
+    pub(crate) fn at_an_instant<T>(&self, f: impl FnOnce() -> T) -> (T, u64) {
         let building = self.repl.building.lock();
         self.repl.frozen.store(true, Release);
         // A write already running holds the stripe it is writing to, so taking
@@ -598,10 +611,10 @@ impl Server {
             }
         }
         let offset = self.repl.offset.load(Acquire);
-        let (image, _skipped) = super::persist::build(self);
+        let made = f();
         self.repl.frozen.store(false, Release);
         drop(building);
-        (image, offset)
+        (made, offset)
     }
 
     /// Take a master's history as our own, which is what a replica does.
