@@ -1161,10 +1161,18 @@ impl Keyspace {
     /// alone, because that is all of it that is in memory, and this is a
     /// question about memory. It is deliberately not read back in to answer:
     /// asking what a key costs should not be the thing that makes it cost that.
+    ///
+    /// The record is the whole run it sits in rather than the three lengths
+    /// added up. A run is rounded up to the arena's alignment and can be holding
+    /// room a longer value left behind, and both of those are memory this key is
+    /// costing the server whether or not it is using them. A real server answers
+    /// the same way, by asking its allocator how big the block it handed out
+    /// really is rather than how much was asked for.
     pub fn key_bytes(&mut self, key: &[u8]) -> Option<usize> {
         self.reap(key);
-        let rec = self.map.get(key)?;
-        let record = yo_index::RawMap::header_len() + key.len() + rec.len();
+        let at = self.map.find(key)?;
+        let rec = self.map.value_at(at);
+        let record = self.map.run_at(at);
         let share = size_of::<yo_index::Bucket>() / yo_index::SLOTS;
         if value::Meta::from_byte(rec[0]).is_cold() {
             return Some(record + share);
