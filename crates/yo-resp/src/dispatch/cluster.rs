@@ -42,8 +42,10 @@
 //! it reads the table and edits it, and a change an operator makes here is
 //! announced by asking the bus to send a packet once the lock is gone.
 //!
-//! What is not here is the failover vote, so a replica of a node that dies is
-//! listed and gossiped correctly and will not promote itself, which is D-152.
+//! What is not here is the manual failover, so `CLUSTER FAILOVER` on a replica
+//! is still refused and an operator who wants to move a master on purpose moves
+//! the slots instead. A replica whose master dies promotes itself, which the
+//! bus runs the election for.
 
 use core::fmt::Write as _;
 use std::sync::atomic::Ordering::Relaxed;
@@ -230,6 +232,10 @@ struct Node {
     offset: u64,
     /// Whether there is an outbound link to it at the moment.
     linked: bool,
+    /// When this node last voted in an election about replacing it, which only
+    /// means anything on a master and is what stops two of its replicas being
+    /// promoted one after the other.
+    voted_time: u64,
     /// Who has said it is unreachable and when they last said so, which is the
     /// weak quorum the FAIL flag needs.
     reports: Vec<(String, u64)>,
@@ -259,6 +265,7 @@ impl Node {
             fail_time: 0,
             offset: 0,
             linked: false,
+            voted_time: 0,
             reports: Vec::new(),
         }
     }
@@ -465,6 +472,8 @@ pub(crate) struct Cluster {
     /// The links, the blacklist and the secret, none of which exist until the
     /// bus is started and none of which a command reads on the hot path.
     bus: bus::Bus,
+    /// The election this node is standing in or voting in, if any.
+    vote: bus::Vote,
     /// The slot migration this node is in, and the ones it has been in.
     asm: asm::Asm,
 }
@@ -487,6 +496,7 @@ impl Default for Cluster {
             reads_when_down: AtomicBool::new(false),
             file: Lock::new(String::new()),
             bus: bus::Bus::default(),
+            vote: bus::Vote::default(),
             asm: asm::Asm::default(),
         }
     }
@@ -2587,9 +2597,14 @@ fn save(server: &Server) -> Result<()> {
         yo_alloc::allow(|| file.clone())
     };
     let epoch = server.cluster.epoch.load(Relaxed);
+    // The vote goes in the file because it has to outlive the process. A node
+    // that voted, restarted and voted again in the same epoch would have voted
+    // twice, and two votes from one master is how two replicas of the same
+    // master both come away believing they won.
+    let voted = server.cluster.vote.given();
     let text = yo_alloc::allow(|| {
         let mut s = lines(server, true);
-        let _ = writeln!(s, "vars currentEpoch {epoch} lastVoteEpoch 0");
+        let _ = writeln!(s, "vars currentEpoch {epoch} lastVoteEpoch {voted}");
         s
     });
     yo_alloc::allow(|| {
@@ -2656,6 +2671,10 @@ impl Server {
                     if pair.len() == 2 && pair[0] == "currentEpoch" {
                         let epoch = pair[1].parse::<u64>().map_err(|_| bad("bad epoch"))?;
                         self.cluster.epoch.store(epoch, Relaxed);
+                    }
+                    if pair.len() == 2 && pair[0] == "lastVoteEpoch" {
+                        let epoch = pair[1].parse::<u64>().map_err(|_| bad("bad epoch"))?;
+                        self.cluster.vote.reload(epoch);
                     }
                 }
                 continue;
@@ -2740,6 +2759,11 @@ impl Server {
                 // and is not read back. There is no link to anybody at startup,
                 // and saying otherwise would stop the bus ever dialling out.
                 linked: false,
+                // Not in the file, which is the reference's shape as well: the
+                // epoch this node last voted in is, and that is the check that
+                // has to survive a restart. This one only spaces two elections
+                // out and a node that has just started has not held one.
+                voted_time: 0,
                 reports: Vec::new(),
             };
             if named.split(',').any(|f| f == "myself") {

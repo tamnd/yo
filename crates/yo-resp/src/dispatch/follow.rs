@@ -339,6 +339,26 @@ impl Server {
         State::from(self.follow.state.load(Relaxed)) == State::Up
     }
 
+    /// How long this server has been out of touch with its master, in
+    /// milliseconds.
+    ///
+    /// While the link is up that is the time since the last byte off it, and
+    /// while it is down it is the time since it went down, which is the
+    /// reference's own pair and is what a failover measures a replica's data
+    /// against. A server following nobody has not been out of touch with
+    /// anybody, so it answers nought.
+    pub(super) fn master_silence(&self, now: u64) -> u64 {
+        if !self.following() {
+            return 0;
+        }
+        let since = if State::from(self.follow.state.load(Relaxed)) == State::Up {
+            self.follow.last_io_ms.load(Relaxed)
+        } else {
+            self.follow.down_ms.load(Relaxed)
+        };
+        now.saturating_sub(since)
+    }
+
     /// Stop following anybody, which is `REPLICAOF NO ONE` and the two ways a
     /// failover ends up back where it started.
     ///
@@ -421,6 +441,13 @@ impl Server {
             .store(if up { State::Up } else { State::Connect } as u8, Relaxed);
         self.follow.last_io_ms.store(self.clock.now_ms(), Relaxed);
         self.follow.down_ms.store(self.clock.now_ms(), Relaxed);
+    }
+
+    /// Say the link to the master went down at this moment, so a test can put
+    /// this server as far out of touch as it likes.
+    pub(super) fn pretend_master_down_at(&self, at: u64) {
+        self.follow.state.store(State::Connect as u8, Relaxed);
+        self.follow.down_ms.store(at, Relaxed);
     }
 
     /// Stop pretending, without the promotion `REPLICAOF NO ONE` does.
