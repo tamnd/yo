@@ -347,6 +347,42 @@ impl List {
         }
     }
 
+    /// Each node in order, as whether it is plain and the bytes that go with it.
+    ///
+    /// Redis writes a list to an RDB as a count of nodes and then a container
+    /// byte and a blob each, where a packed node is a whole listpack and a plain
+    /// node is one element that was too long to pack. The two bands here line up
+    /// with that exactly, which is what makes the writer cheap: the packed band
+    /// is already the listpack a single node payload wants, and a chunk is
+    /// already the entry region of one and only needs a header and a terminator
+    /// put round it. Nothing is decoded on the way out.
+    ///
+    /// The number of calls is [`List::nodes`], so a caller writing a count in
+    /// front of this does not have to walk twice to find it.
+    pub fn for_each_node(&self, mut each: impl FnMut(bool, &[u8])) {
+        match &self.body {
+            Body::Packed(lp) => each(false, lp.as_bytes()),
+            Body::Chunks(d) => {
+                // One buffer for the whole walk, grown to the largest node and
+                // reused, rather than an allocation per chunk.
+                let mut buf = Vec::new();
+                for c in &d.chunks {
+                    // An integer can never be long enough to need a chunk of
+                    // its own, so the arm below is unreachable for a plain
+                    // node, and it packs rather than asserting because a wrong
+                    // guess here should cost bytes and not the server.
+                    if let Some(Element::Str(value)) = c.is_plain().then(|| c.get(0)).flatten() {
+                        each(true, value);
+                        continue;
+                    }
+                    buf.clear();
+                    crate::listpack::wrap(c.entries(), c.len(), &mut buf);
+                    each(false, &buf);
+                }
+            }
+        }
+    }
+
     /// The element at `index` from the front.
     #[must_use]
     pub fn get(&self, index: usize) -> Option<Element<'_>> {

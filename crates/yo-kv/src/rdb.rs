@@ -457,11 +457,12 @@ pub(crate) fn object(rec: &Record, key: Option<&[u8]>, out: &mut Vec<u8>) -> boo
             put_str(out, bytes);
         }
         Body::List(list) => {
-            put_head(out, T_LIST, key);
-            put_len(out, list.len() as u64);
-            for element in list.iter() {
-                put_entry(out, element);
-            }
+            put_head(out, T_LIST_QUICKLIST_2, key);
+            put_len(out, list.nodes() as u64);
+            list.for_each_node(|plain, blob| {
+                put_len(out, if plain { NODE_PLAIN } else { NODE_PACKED });
+                put_str(out, blob);
+            });
         }
         Body::Set(set) => match (set.encoding(), set.packed_bytes()) {
             (set::Encoding::Intset, Some(blob)) => {
@@ -1626,6 +1627,107 @@ mod tests {
             seen,
             vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
         );
+    }
+
+    /// The elements of a list, in order, as a client would see them.
+    fn elements(list: &List) -> Vec<Vec<u8>> {
+        list.iter()
+            .map(|e| {
+                let mut buf = Vec::new();
+                e.write_to(&mut buf);
+                buf
+            })
+            .collect()
+    }
+
+    /// A list in the packed band is one packed node holding the listpack itself.
+    ///
+    /// The shape matters as much as the round trip does, because this is the
+    /// payload a real server reads, so the test looks at the bytes rather than
+    /// only at what comes back out of them.
+    #[test]
+    fn a_short_list_is_one_packed_node() {
+        let l = list::Limits::default();
+        let mut list = List::new();
+        for v in [&b"one"[..], b"two", b"three"] {
+            list.push_back(v, &l);
+        }
+        let rec = Record::new(Body::List(list), None);
+        let payload = dump(&rec).expect("a list has an RDB shape");
+        assert_eq!(payload[0], T_LIST_QUICKLIST_2);
+        // One node, packed, and then the listpack as a string. Three short
+        // elements, so both lengths are a single byte.
+        assert_eq!(payload[1], 1);
+        assert_eq!(u64::from(payload[2]), NODE_PACKED);
+    }
+
+    /// A list past the packed band goes out as a node per chunk.
+    #[test]
+    fn a_long_list_goes_out_a_node_at_a_time() {
+        let l = list::Limits::default();
+        let mut list = List::new();
+        for i in 0..4000 {
+            list.push_back(format!("value number {i}").as_bytes(), &l);
+        }
+        assert!(list.nodes() > 1, "this list should have broken into chunks");
+        let want = elements(&list);
+        let nodes = list.nodes();
+        let rec = Record::new(Body::List(list), None);
+        let payload = dump(&rec).expect("a list has an RDB shape");
+        assert_eq!(payload[0], T_LIST_QUICKLIST_2);
+        assert_eq!(u64::from(payload[1]), nodes as u64);
+
+        let (s, h, ll, z) = limits();
+        let all = Limits {
+            set: &s,
+            hash: &h,
+            list: &ll,
+            zset: &z,
+        };
+        let Body::List(back) = load(&payload, all, 0).expect("what we wrote we can read") else {
+            panic!("a list came back as something else");
+        };
+        assert_eq!(elements(&back), want);
+    }
+
+    /// One element too long for a chunk is a plain node holding it as it lies.
+    ///
+    /// Redis writes the value itself there rather than a listpack of one entry,
+    /// so a payload that packed it would still read back correctly here and
+    /// would be a different length from the one a real server writes.
+    #[test]
+    fn an_oversized_element_is_a_plain_node() {
+        let l = list::Limits::default();
+        let big = vec![b'y'; 9000];
+        let build = || {
+            let mut list = List::new();
+            list.push_back(b"first", &l);
+            list.push_back(&big, &l);
+            list.push_back(b"last", &l);
+            list
+        };
+        let list = build();
+        let want = elements(&list);
+
+        // The middle node is the value on its own, and the two around it are
+        // listpacks, which is the split the container byte carries.
+        let mut nodes = Vec::new();
+        list.for_each_node(|plain, blob| nodes.push((plain, blob.len())));
+        assert_eq!(nodes.len(), 3);
+        assert!(!nodes[0].0);
+        assert_eq!(nodes[1], (true, big.len()));
+        assert!(!nodes[2].0);
+
+        let rec = Record::new(Body::List(list), None);
+        let payload = dump(&rec).expect("a list has an RDB shape");
+        assert_eq!(payload[0], T_LIST_QUICKLIST_2);
+        assert_eq!(payload[1], 3, "the big one is a node of its own");
+        assert_eq!(u64::from(payload[2]), NODE_PACKED);
+
+        let Body::List(back) = round_trip(Body::List(build())) else {
+            panic!("a list came back as something else");
+        };
+        assert_eq!(elements(&back), want);
     }
 
     #[test]

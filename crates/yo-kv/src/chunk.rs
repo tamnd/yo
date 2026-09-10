@@ -150,6 +150,21 @@ impl Chunk {
         self.count == 0
     }
 
+    /// Whether this is one oversized element rather than a run of them.
+    ///
+    /// Redis calls that a plain node and writes it to an RDB as the value on
+    /// its own rather than as a listpack holding one entry, so the writer has
+    /// to be able to tell the two apart. There is no flag for it because there
+    /// does not need to be one: a chunk is only ever sized to a single element
+    /// when that element is longer than an ordinary chunk, so holding one entry
+    /// that is longer than an ordinary chunk is the same question asked from
+    /// the other side.
+    #[must_use]
+    #[inline]
+    pub const fn is_plain(&self) -> bool {
+        self.count == 1 && self.live_bytes() > CHUNK_BYTES
+    }
+
     /// What it costs, buffer included.
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
