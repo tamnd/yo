@@ -31,11 +31,12 @@
 //!
 //! # What is not here
 //!
-//! The failover vote. `FAILOVER_AUTH_REQUEST`, `FAILOVER_AUTH_ACK` and
-//! `MFSTART` are recognised and dropped rather than answered, so a yo node
-//! neither runs an election nor votes in one. That is a change of its own with
-//! its own tests, and shipping the link layer without it is what lets a cluster
-//! be built and watched while the election is being written.
+//! The manual failover. `MFSTART` is recognised and dropped rather than
+//! answered, so a real server's replica that is asked to take over by hand
+//! waits its five seconds out and gives up, and `CLUSTER FAILOVER` here is
+//! still refused. The vote it would use is in, since the same election runs
+//! whether the master died or is being stood down, and the flag that says the
+//! master is up and in on it is honoured on the side being asked.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -131,6 +132,11 @@ const T_MFSTART: u16 = 8;
 const T_MODULE: u16 = 9;
 const T_PUBLISHSHARD: u16 = 10;
 
+/// The message flag that says vote for me even though my master is up, which is
+/// the only thing that makes a manual failover different from any other on the
+/// side being asked.
+const MF_FORCEACK: u8 = 2;
+
 /// The one message flag that goes out on everything, which says this node
 /// understands the extensions on the end of a ping and is safe to send them to.
 const MF_EXT_DATA: u8 = 4;
@@ -170,6 +176,83 @@ const NODE_TIMEOUT_MS: u64 = 15_000;
 /// How long to wait on a connect to another node's bus port before giving up
 /// and trying again on the next tick.
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// The fixed part of the wait before a replica asks to be promoted.
+///
+/// Long enough for the FAIL message to have got round the cluster, because a
+/// vote asked for before the electorate agrees the master is gone is a vote
+/// nobody may grant. The reference adds a random part on top of the same size,
+/// which is what keeps two replicas that noticed at the same moment from asking
+/// at the same moment.
+const ELECTION_DELAY_MS: u64 = 500;
+
+/// How much later a replica asks for every other replica that holds more data
+/// than it does.
+///
+/// This is the whole of how the cluster picks the best replica without anybody
+/// comparing offsets: the one with the most data asks first, and the others are
+/// still waiting when it has already won.
+const RANK_DELAY_MS: u64 = 1000;
+
+/// How long an election may take before it is written off, and how long after
+/// that before another one is started.
+///
+/// Timeout is twice the node timeout with a floor of two seconds and retry is
+/// twice the timeout, which are the reference's numbers. The gap between them is
+/// what keeps a replica that cannot win from asking again and again and running
+/// the epoch up on every master in the cluster.
+const ELECTION_TIMEOUT_MS: u64 = if NODE_TIMEOUT_MS * 2 > 2000 {
+    NODE_TIMEOUT_MS * 2
+} else {
+    2000
+};
+
+/// How stale a replica's data may be and still be worth promoting.
+///
+/// The reference works this out from `repl-ping-replica-period` and
+/// `cluster-replica-validity-factor`, neither of which is in the config table
+/// yet, so this is those two at their defaults: ten seconds of ping period plus
+/// ten node timeouts. A replica further behind than that is one whose master was
+/// unreachable long before it died, and promoting it would lose more than
+/// letting the shard stay down does.
+const STALE_DATA_MS: u64 = 10_000 + NODE_TIMEOUT_MS * 10;
+
+/// The election this node is standing in or voting in.
+///
+/// Atomics rather than a lock because they are read from the cron and written
+/// from whichever link thread a packet arrived on, and nothing here is read
+/// together with anything else here except by the cron, which is the only writer
+/// of everything but the count.
+#[derive(Default)]
+pub(super) struct Vote {
+    /// The epoch this node last gave its vote away in, which is the reference's
+    /// `lastVoteEpoch` and is the whole of one vote per epoch.
+    given: AtomicU64,
+    /// When this node may start asking, or nought when it never has.
+    at: AtomicU64,
+    /// How many votes have come back for the election in `epoch`.
+    count: AtomicU64,
+    /// The epoch this node is standing in.
+    epoch: AtomicU64,
+    /// How many replicas of the same master held more data than this one when
+    /// the delay was worked out, which is what that delay is made of.
+    rank: AtomicU64,
+    /// Whether the request has gone out, so that a reply is worth counting and
+    /// the delay is not recomputed underneath it.
+    sent: AtomicBool,
+}
+
+impl Vote {
+    /// The epoch this node last voted in, for the config file.
+    pub(super) fn given(&self) -> u64 {
+        self.given.load(Relaxed)
+    }
+
+    /// Put back what the config file said, which is why the file has it.
+    pub(super) fn reload(&self, epoch: u64) {
+        self.given.store(epoch, Relaxed);
+    }
+}
 
 /// Read a big endian field out of a packet, or nought when it is off the end.
 ///
@@ -501,6 +584,23 @@ fn accept(server: &Arc<Server>, door: &TcpListener) {
     }
 }
 
+/// Start the clock on a node this one could not open a link to.
+///
+/// Failure detection measures the time since a ping went out and a node with no
+/// link has had no ping to send, so without this a node whose address stops
+/// answering is retried for ever and never marked as failing. The reference
+/// does the same thing in the same place and for the same reason: it says it
+/// sent a ping now, which is true in the sense that one will go out the moment
+/// there is anything to send it down.
+fn unreachable(server: &Arc<Server>, id: &str) {
+    let mut map = server.cluster.map.lock();
+    if let Some(at) = map.find(id.as_bytes())
+        && map.nodes[usize::from(at)].ping_sent == 0
+    {
+        map.nodes[usize::from(at)].ping_sent = server.now_ms();
+    }
+}
+
 /// Open a link to a node and start reading it.
 ///
 /// Returns whether it worked, which the cron uses to decide whether the node is
@@ -508,6 +608,7 @@ fn accept(server: &Arc<Server>, door: &TcpListener) {
 /// never called with the node table locked.
 fn dial(server: &Arc<Server>, id: &str, host: &str, bus: u16, meet: bool) -> bool {
     let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(host, bus)) else {
+        unreachable(server, id);
         return false;
     };
     let mut sock = None;
@@ -518,11 +619,13 @@ fn dial(server: &Arc<Server>, id: &str, host: &str, bus: u16, meet: bool) -> boo
         }
     }
     let Some(sock) = sock else {
+        unreachable(server, id);
         return false;
     };
     let _ = sock.set_nodelay(true);
     let now = server.now_ms();
     let Some(wire) = Wire::new(sock, false, id, now) else {
+        unreachable(server, id);
         return false;
     };
     server.cluster.bus.add(&wire);
@@ -538,7 +641,13 @@ fn dial(server: &Arc<Server>, id: &str, host: &str, bus: u16, meet: bool) -> boo
             // and the node goes away, which is what should happen to an address
             // that has nothing at it.
             map.nodes[usize::from(at)].flags &= !FLAG_MEET;
-            if !meet {
+            // A ping that was outstanding before the link went is left where it
+            // was, so that the clock failure detection runs on is the one that
+            // started when the node went quiet rather than one that is reset
+            // every time the link is opened again. That is the reference's
+            // `old_ping_sent` and without it a node that is up but unreachable
+            // is never given up on.
+            if !meet && map.nodes[usize::from(at)].ping_sent == 0 {
                 map.nodes[usize::from(at)].ping_sent = now;
             }
         }
@@ -1073,10 +1182,38 @@ fn digest(
             todo.save = true;
             return;
         }
-        // The election is not in yet, so a vote is neither asked for nor
-        // answered. Dropping these keeps a mixed cluster gossiping happily and
-        // means a yo node simply never wins or grants an election.
-        T_AUTH_REQUEST | T_AUTH_ACK | T_MFSTART | T_MODULE => return,
+        T_AUTH_REQUEST => {
+            // A vote is only ever given to a node this one knows, because the
+            // whole question is about a master this node has an opinion on.
+            if let Some(at) = sender
+                && vote_if_needed(server, map, at, p, now)
+            {
+                let mut packet = header(server, map, T_AUTH_ACK);
+                seal(&mut packet);
+                yo_alloc::allow(|| todo.reply.push(packet));
+                todo.save = true;
+            }
+            return;
+        }
+        T_AUTH_ACK => {
+            // Only a master serving slots has a vote to give, and only a vote
+            // cast in the epoch this node is standing in counts. The second
+            // check is what stops a late reply to a previous election being
+            // counted towards this one.
+            let vote = &server.cluster.vote;
+            if let Some(at) = sender
+                && map.nodes[usize::from(at)].is_master()
+                && !map.runs(at).is_empty()
+                && be64(p, O_CURRENT_EPOCH) >= vote.epoch.load(Relaxed)
+            {
+                vote.count.fetch_add(1, Relaxed);
+            }
+            return;
+        }
+        // Manual failover is not in yet, so the request to pause is dropped and
+        // a real server's replica asking for one simply waits it out. Modules
+        // are not a thing here at all.
+        T_MFSTART | T_MODULE => return,
         _ => return,
     }
 
@@ -1526,6 +1663,15 @@ fn claim_slots(
     claim: &[u8],
     todo: &mut Todo,
 ) {
+    // Whose slots decide where this node belongs afterwards. A master answers
+    // for its own and a replica answers for its master's, because a replica of a
+    // master that has just lost everything is a replica of nothing and is how a
+    // second replica of a failed master finds the one that replaced it.
+    let ours = if map.nodes[0].is_master() {
+        Some(0)
+    } else {
+        map.nodes[0].master
+    };
     let mut lost = 0usize;
     for slot in 0..SLOTS {
         if !bit(claim, slot) {
@@ -1539,8 +1685,10 @@ fn claim_slots(
         if !newer {
             continue;
         }
-        if held == Some(0) {
+        if held == ours {
             lost += 1;
+        }
+        if held == Some(0) {
             yo_alloc::allow(|| todo.lost.push(slot as u16));
         }
         map.owner[slot] = Some(owner);
@@ -1550,7 +1698,7 @@ fn claim_slots(
     // A master that has just given away its last slot is not a master any more.
     // Following the node that took them is what a real server does and is what
     // makes a failed master come back as a replica of whoever replaced it.
-    if lost > 0 && map.runs(0).is_empty() && owner != 0 {
+    if lost > 0 && ours.is_some_and(|at| map.runs(at).is_empty()) && owner != 0 {
         todo.demoted = true;
         map.nodes[0].flags &= !FLAG_MASTER;
         map.nodes[0].flags |= FLAG_SLAVE;
@@ -1570,6 +1718,229 @@ fn claim_slots(
     // this runs under, and the lock is not reentrant, so the caller does it
     // once the lock is gone.
     todo.recount = true;
+}
+
+// ------------------------------------------------------------ the failover vote
+
+/// Answer a replica asking to be promoted, if every condition holds.
+///
+/// This is the reference's `clusterSendFailoverAuthIfNeeded` and the order of
+/// the checks is its order, because the order is the safety. A master gets one
+/// vote per epoch and gives it to the first replica that asks, and everything
+/// in front of that is about making sure the question was a fair one to ask.
+///
+/// Nothing is sent back when a condition fails. There is no such thing as a no
+/// vote on this protocol: a replica counts the yeses it got and gives up when
+/// the election times out, which means a master that has crashed and a master
+/// that disapproves look the same from where the replica is standing. That is
+/// deliberate, since the alternative is a reply that a replica could be made to
+/// wait for.
+fn vote_if_needed(server: &Arc<Server>, map: &mut Map, at: u16, p: &[u8], now: u64) -> bool {
+    // Only a master serving a slot has a vote, because the electorate is the
+    // masters that serve slots and nothing else would make the quorum add up.
+    if map.nodes[0].flags & FLAG_SLAVE != 0 || map.runs(0).is_empty() {
+        return false;
+    }
+    // The asking node's epoch cannot be behind this node's. It cannot really be
+    // ahead either, since reading the packet has already pulled this node's
+    // epoch up to it, so what this catches is a request that was already stale
+    // when it arrived.
+    let epoch = server.cluster.epoch.load(Relaxed);
+    if be64(p, O_CURRENT_EPOCH) < epoch {
+        return false;
+    }
+    // One vote per epoch, and it has already gone.
+    if server.cluster.vote.given.load(Relaxed) == epoch {
+        return false;
+    }
+    // It has to be a replica, this node has to know whose, and that master has
+    // to be one the cluster has given up on. A manual failover is the exception
+    // and says so in the packet, because there the master is up and is in on it.
+    let asking = &map.nodes[usize::from(at)];
+    let Some(master) = asking.master.filter(|_| asking.flags & FLAG_SLAVE != 0) else {
+        return false;
+    };
+    let forced = p.get(O_MFLAGS).is_some_and(|f| f & MF_FORCEACK != 0);
+    if map.nodes[usize::from(master)].flags & FLAG_FAIL == 0 && !forced {
+        return false;
+    }
+    // Not twice about the same master inside two node timeouts. A second replica
+    // of the same master asking straight after the first is either the first one
+    // having failed to win or two of them racing, and in both cases the answer
+    // that keeps the shard with one master is to wait and see how the first one
+    // went.
+    if now.saturating_sub(map.nodes[usize::from(master)].voted_time) < NODE_TIMEOUT_MS * 2 {
+        return false;
+    }
+    // The slots it is claiming have to be ones it would be claiming under an
+    // epoch at least as new as whoever is serving them here. A replica asking to
+    // take over slots that have already moved somewhere newer is a replica that
+    // has been out of touch, and voting for it would undo the move.
+    let claimed = be64(p, O_CONFIG_EPOCH);
+    for slot in 0..SLOTS {
+        if !bit(&p[O_SLOTS..O_SLOTS + BITMAP_LEN], slot) {
+            continue;
+        }
+        if map.owner[slot].is_some_and(|held| map.nodes[usize::from(held)].epoch > claimed) {
+            return false;
+        }
+    }
+    server.cluster.vote.given.store(epoch, Relaxed);
+    map.nodes[usize::from(master)].voted_time = now;
+    true
+}
+
+/// How many replicas of the same master hold more data than this node does.
+///
+/// The reference's `clusterGetSlaveRank`, and the offsets it compares are the
+/// ones the other replicas put in their own packets rather than anything asked
+/// for, so a rank is always a little out of date and that is fine: it decides a
+/// delay and not an outcome.
+fn rank_of(map: &Map, master: u16, mine: u64) -> u64 {
+    map.nodes
+        .iter()
+        .skip(1)
+        .filter(|node| {
+            node.master == Some(master)
+                && node.flags & FLAG_SLAVE != 0
+                && node.flags & FLAG_NOFAILOVER == 0
+                && node.offset > mine
+        })
+        .count() as u64
+}
+
+/// What the cron has to do about the election, worked out under the lock.
+enum Step {
+    /// Nothing, which is the answer on nearly every tick of nearly every node.
+    Idle,
+    /// The delay has just been worked out, so tell the other replicas of this
+    /// master how far this node has got in case it changes their minds.
+    Announce,
+    /// Ask every node for a vote.
+    Ask(Vec<u8>),
+    /// The quorum is in and the slots are this node's now.
+    Won,
+}
+
+/// Work out what this tick of the election does, under the map lock.
+///
+/// The reference's `clusterHandleSlaveFailover`. Every branch of it returns and
+/// waits for the next tick rather than carrying on, which is what makes the
+/// whole thing readable: the state is in one place and each tick moves it at
+/// most one step.
+fn decide(server: &Arc<Server>, map: &mut Map, now: u64) -> Step {
+    let vote = &server.cluster.vote;
+    // A replica of a master the cluster has given up on, which is willing to be
+    // promoted, and whose master was serving something worth taking over.
+    let me = &map.nodes[0];
+    if me.flags & (FLAG_SLAVE | FLAG_NOFAILOVER) != FLAG_SLAVE {
+        return Step::Idle;
+    }
+    let Some(master) = me.master else {
+        return Step::Idle;
+    };
+    if map.nodes[usize::from(master)].flags & FLAG_FAIL == 0 || map.runs(master).is_empty() {
+        return Step::Idle;
+    }
+    // How far out of touch with the master this node was before it died. The
+    // node timeout comes off because that much silence is what made it dead in
+    // the first place and is not the replica's fault.
+    if server.master_silence(now).saturating_sub(NODE_TIMEOUT_MS) > STALE_DATA_MS {
+        return Step::Idle;
+    }
+    let since = now as i64 - vote.at.load(Relaxed) as i64;
+    if since > (ELECTION_TIMEOUT_MS * 2) as i64 {
+        // Nothing running, or the last one is long enough ago to try again. The
+        // delay is a fixed part, a random part and a part per replica that holds
+        // more data than this one.
+        let rank = rank_of(map, master, server.repl_offset());
+        vote.at.store(
+            now + ELECTION_DELAY_MS
+                + u64::from(pick(ELECTION_DELAY_MS as usize))
+                + rank * RANK_DELAY_MS,
+            Relaxed,
+        );
+        vote.rank.store(rank, Relaxed);
+        vote.count.store(0, Relaxed);
+        vote.sent.store(false, Relaxed);
+        return Step::Announce;
+    }
+    if !vote.sent.load(Relaxed) {
+        // Another replica may have said something since the delay was worked
+        // out. Falling further down the order pushes the delay back, and
+        // climbing it does not pull it forward, which is the reference's rule
+        // and is what keeps two replicas swapping places from both asking at
+        // once.
+        let rank = rank_of(map, master, server.repl_offset());
+        let was = vote.rank.load(Relaxed);
+        if rank > was {
+            vote.at.fetch_add((rank - was) * RANK_DELAY_MS, Relaxed);
+            vote.rank.store(rank, Relaxed);
+        }
+        if now < vote.at.load(Relaxed) {
+            return Step::Idle;
+        }
+    }
+    if since > ELECTION_TIMEOUT_MS as i64 {
+        // Too late to be worth counting. The retry window above is what starts
+        // the next one.
+        return Step::Idle;
+    }
+    if !vote.sent.load(Relaxed) {
+        let epoch = server.cluster.epoch.fetch_add(1, Relaxed) + 1;
+        vote.epoch.store(epoch, Relaxed);
+        vote.sent.store(true, Relaxed);
+        let mut packet = header(server, map, T_AUTH_REQUEST);
+        seal(&mut packet);
+        return Step::Ask(packet);
+    }
+    if vote.count.load(Relaxed) < (map.size() / 2 + 1) as u64 {
+        return Step::Idle;
+    }
+    let epoch = vote.epoch.load(Relaxed);
+    if map.nodes[0].epoch < epoch {
+        map.nodes[0].epoch = epoch;
+    }
+    // Everything the old master was serving is this node's now, and saying so
+    // under an epoch nobody else has used is what makes every other node believe
+    // it over whatever it had written down.
+    map.nodes[0].flags &= !FLAG_SLAVE;
+    map.nodes[0].flags |= FLAG_MASTER;
+    map.nodes[0].master = None;
+    for slot in 0..SLOTS {
+        if map.owner[slot] == Some(master) {
+            map.owner[slot] = Some(0);
+        }
+    }
+    Step::Won
+}
+
+/// Stand for election when the master is gone, and take over on winning.
+fn failover(server: &Arc<Server>, now: u64) {
+    let step = {
+        let mut map = server.cluster.map.lock();
+        decide(server, &mut map, now)
+    };
+    match step {
+        Step::Idle => {}
+        // The reference sends this to the other replicas of the same master and
+        // this sends it to everybody, which is a packet more per node on a
+        // cluster that has just lost one and is the same answer.
+        Step::Announce => server.cluster_broadcast_pong(),
+        Step::Ask(packet) => {
+            for link in server.cluster.bus.all() {
+                link.send(&packet);
+            }
+            server.cluster.bus.dirty.store(true, Relaxed);
+        }
+        Step::Won => {
+            server.stop_following();
+            server.recount_coverage();
+            server.cluster.bus.dirty.store(true, Relaxed);
+            let _ = super::save(server);
+            server.cluster_broadcast_pong();
+        }
+    }
 }
 
 // ---------------------------------------------------------------- the cron
@@ -1687,10 +2058,14 @@ fn cron(server: &Arc<Server>) {
             if let Some(link) = server.cluster.bus.outbound(&id) {
                 link.send(&packet);
             } else {
+                // The link went between deciding to ping and sending it, so the
+                // node is dialled again on the next tick. The ping is left
+                // standing rather than taken back, because it is what failure
+                // detection measures and a node that cannot be sent a ping is
+                // exactly the node that should be running out of time.
                 let mut map = server.cluster.map.lock();
                 if let Some(at) = map.find(id.as_bytes()) {
                     map.nodes[usize::from(at)].linked = false;
-                    map.nodes[usize::from(at)].ping_sent = 0;
                 }
             }
         }
@@ -1705,6 +2080,7 @@ fn cron(server: &Arc<Server>) {
             server.cluster.bus.dirty.store(true, Relaxed);
         }
         server.recount_coverage();
+        failover(server, now);
         server.asm_cron();
         server.asm_relax();
         // The file is written at most ten times a second and only when something
@@ -1980,6 +2356,306 @@ mod tests {
         put16(&mut p, O_COUNT, 1);
         assert_eq!(expected(&p, T_PING), Some(HDR_LEN + GOSSIP_LEN));
         assert_ne!(expected(&p, T_PING), Some(p.len()));
+    }
+
+    /// A node table with a master that is about to fail, one replica of it and
+    /// two other masters, which is the smallest cluster an election means
+    /// anything on.
+    ///
+    /// Node 0 is this server and is the replica standing for election. Node 1 is
+    /// its master and owns the first third of the slots, and nodes 2 and 3 own
+    /// the rest, so the quorum is two and this node is not part of it.
+    /// A wall clock reading, since every span in an election is measured
+    /// against one and a node that has just started is not two node timeouts
+    /// away from the epoch.
+    const T0: u64 = 1_700_000_000_000;
+
+    fn shard() -> Arc<Server> {
+        let mut server = Server::new();
+        server.enable_cluster("", 7000);
+        let server = Arc::new(server);
+        let master = server.cluster_pretend_node("1".repeat(40).as_str(), "10.0.0.1", 7001);
+        let other = server.cluster_pretend_node("2".repeat(40).as_str(), "10.0.0.2", 7002);
+        let third = server.cluster_pretend_node("3".repeat(40).as_str(), "10.0.0.3", 7003);
+        server.cluster_pretend_follower(master);
+        {
+            let mut map = server.cluster.map.lock();
+            for slot in 0..SLOTS {
+                map.owner[slot] = Some(match slot {
+                    0..=5460 => master,
+                    5461..=10922 => other,
+                    _ => third,
+                });
+            }
+        }
+        server.recount_coverage();
+        server
+    }
+
+    /// An `AUTH_REQUEST` as a replica of node 1 would send it.
+    fn asking(epoch: u64, config: u64, forced: bool) -> Vec<u8> {
+        let mut p = vec![0u8; HDR_LEN];
+        put64(&mut p, O_CURRENT_EPOCH, epoch);
+        put64(&mut p, O_CONFIG_EPOCH, config);
+        for slot in 0..=5460 {
+            set_bit(&mut p[O_SLOTS..O_SLOTS + BITMAP_LEN], slot);
+        }
+        p[O_MFLAGS] = if forced { MF_FORCEACK } else { 0 };
+        p
+    }
+
+    /// A node that cannot be dialled has to start running out of time, or the
+    /// election it should be losing never happens.
+    ///
+    /// Failure detection measures the time since a ping went out, and a node
+    /// with no link never gets one sent, so the address that stops answering is
+    /// the one case where the clock has to be started by hand.
+    #[test]
+    fn a_node_that_cannot_be_reached_is_treated_as_pinged() {
+        let server = shard();
+        let id = "1".repeat(40);
+        assert_eq!(server.cluster.map.lock().nodes[1].ping_sent, 0);
+        unreachable(&server, &id);
+        let first = server.cluster.map.lock().nodes[1].ping_sent;
+        assert!(first > 0, "the clock is running");
+        // And the next failed dial leaves it where it is, because the span that
+        // matters is the one since the node went quiet and not the one since
+        // the last attempt to reach it.
+        unreachable(&server, &id);
+        assert_eq!(server.cluster.map.lock().nodes[1].ping_sent, first);
+        // A name nobody knows is not an error, it is a node that has been
+        // forgotten between the decision to dial it and the attempt.
+        unreachable(&server, &"9".repeat(40));
+    }
+
+    /// Every reason a master has for not answering a replica that wants its
+    /// master's slots, in the order a real server checks them.
+    ///
+    /// The order is the safety rather than a detail of the implementation, so
+    /// each one is arranged to be the only thing wrong.
+    #[test]
+    fn a_vote_is_given_once_and_only_when_every_condition_holds() {
+        let server = shard();
+        // Stand this node up as a master serving the last third, and put a
+        // replica of node 1 in the table for it to be asked about.
+        {
+            let mut map = server.cluster.map.lock();
+            map.nodes[0].flags &= !FLAG_SLAVE;
+            map.nodes[0].flags |= FLAG_MASTER;
+            map.nodes[0].master = None;
+            for slot in 10923..SLOTS {
+                map.owner[slot] = Some(0);
+            }
+            let mut replica = Node::new(
+                "4".repeat(40),
+                "10.0.0.4".to_owned(),
+                7004,
+                7004 + 10000,
+                FLAG_SLAVE,
+                0,
+            );
+            replica.master = Some(1);
+            map.nodes.push(replica);
+        }
+        let at = 4u16;
+        let ask = |server: &Arc<Server>, p: &[u8], now: u64| {
+            let mut map = server.cluster.map.lock();
+            vote_if_needed(server, &mut map, at, p, now)
+        };
+        // A replica bumps the epoch before it asks and reading the packet pulls
+        // this node's up to it, so by the time the question is put the two
+        // agree and neither is nought.
+        server.cluster.epoch.store(1, Relaxed);
+
+        // The master it wants to replace is up and nobody said this was a manual
+        // failover, so there is nothing to vote about.
+        assert!(!ask(&server, &asking(1, 0, false), T0));
+        // A manual failover says so in the packet, and that is the whole
+        // difference from where the voter is standing.
+        assert!(ask(&server, &asking(1, 0, true), T0));
+        // One vote per epoch, and it has gone.
+        assert!(!ask(&server, &asking(1, 0, true), T0));
+
+        // Give up on node 1 and move the epoch on, which is what a real replica
+        // would have done before asking again.
+        server.cluster.epoch.store(2, Relaxed);
+        {
+            let mut map = server.cluster.map.lock();
+            map.nodes[1].flags |= FLAG_FAIL;
+        }
+        // Not twice about the same master inside two node timeouts, however
+        // dead it is, because the first replica may still be winning.
+        assert!(!ask(&server, &asking(2, 0, false), T0 + NODE_TIMEOUT_MS));
+        let later = T0 + NODE_TIMEOUT_MS * 2 + 1;
+        // A request that was stale before it arrived.
+        assert!(!ask(&server, &asking(1, 0, false), later));
+        // A node that is not a replica has no master to replace.
+        {
+            let mut map = server.cluster.map.lock();
+            map.nodes[4].flags &= !FLAG_SLAVE;
+        }
+        assert!(!ask(&server, &asking(2, 0, false), later));
+        {
+            let mut map = server.cluster.map.lock();
+            map.nodes[4].flags |= FLAG_SLAVE;
+        }
+        // Slots that have already moved somewhere newer than the epoch the
+        // replica would claim them under. Voting for that would undo the move.
+        {
+            let mut map = server.cluster.map.lock();
+            map.owner[3000] = Some(2);
+            map.nodes[2].epoch = 7;
+        }
+        assert!(!ask(&server, &asking(2, 6, false), later));
+        // The same request under an epoch that is not behind is fine.
+        assert!(ask(&server, &asking(2, 7, false), later));
+        assert_eq!(server.cluster.vote.given(), 2);
+
+        // And a node with no slots of its own is not part of the electorate at
+        // all, however much it knows about the shard.
+        server.cluster.epoch.store(3, Relaxed);
+        {
+            let mut map = server.cluster.map.lock();
+            for slot in 0..SLOTS {
+                if map.owner[slot] == Some(0) {
+                    map.owner[slot] = Some(3);
+                }
+            }
+        }
+        assert!(!ask(
+            &server,
+            &asking(3, 7, false),
+            later + NODE_TIMEOUT_MS * 3
+        ));
+    }
+
+    /// A replica of a master the cluster has given up on waits its turn, asks
+    /// once, and takes the slots over when the quorum is in.
+    #[test]
+    fn an_election_waits_then_asks_then_wins() {
+        let server = shard();
+        let step = |server: &Arc<Server>, now: u64| {
+            let mut map = server.cluster.map.lock();
+            decide(server, &mut map, now)
+        };
+
+        // The master is up, so there is no election to hold.
+        assert!(matches!(step(&server, T0), Step::Idle));
+        {
+            let mut map = server.cluster.map.lock();
+            map.nodes[1].flags |= FLAG_FAIL;
+        }
+        // The first tick after that works out when this node may ask and tells
+        // the other replicas how far it has got.
+        assert!(matches!(step(&server, T0), Step::Announce));
+        let at = server.cluster.vote.at.load(Relaxed);
+        assert!(
+            (T0 + 500..=T0 + 1000).contains(&at),
+            "half a second plus up to half a second more, got {at}"
+        );
+        // Until then there is nothing to do.
+        assert!(matches!(step(&server, at - 1), Step::Idle));
+
+        // A replica that turns out to hold more data than this one pushes the
+        // turn back by a second, and one that falls behind does not pull it
+        // forward again.
+        {
+            let mut map = server.cluster.map.lock();
+            let mut ahead = Node::new(
+                "5".repeat(40),
+                "10.0.0.5".to_owned(),
+                7005,
+                7005 + 10000,
+                FLAG_SLAVE,
+                0,
+            );
+            ahead.master = Some(1);
+            ahead.offset = 900;
+            map.nodes.push(ahead);
+        }
+        assert!(matches!(step(&server, at), Step::Idle));
+        assert_eq!(server.cluster.vote.at.load(Relaxed), at + RANK_DELAY_MS);
+        {
+            let mut map = server.cluster.map.lock();
+            map.nodes[4].offset = 0;
+        }
+        assert!(matches!(step(&server, at), Step::Idle));
+        assert_eq!(server.cluster.vote.at.load(Relaxed), at + RANK_DELAY_MS);
+
+        // Then it asks, once, under an epoch of its own.
+        let now = at + RANK_DELAY_MS;
+        let Step::Ask(packet) = step(&server, now) else {
+            panic!("the turn has come");
+        };
+        assert_eq!(be64(&packet, O_CURRENT_EPOCH), 1);
+        assert_eq!(server.cluster.vote.epoch.load(Relaxed), 1);
+        // The slots in the request are the master's, because those are the ones
+        // the answer is about.
+        assert!(bit(&packet[O_SLOTS..O_SLOTS + BITMAP_LEN], 5460));
+        assert!(!bit(&packet[O_SLOTS..O_SLOTS + BITMAP_LEN], 5461));
+        assert!(matches!(step(&server, now), Step::Idle), "asked already");
+
+        // One vote out of the three masters is not a quorum.
+        server.cluster.vote.count.store(1, Relaxed);
+        assert!(matches!(step(&server, now), Step::Idle));
+        server.cluster.vote.count.store(2, Relaxed);
+        assert!(matches!(step(&server, now), Step::Won));
+
+        let map = server.cluster.map.lock();
+        assert!(map.nodes[0].is_master());
+        assert_eq!(map.nodes[0].master, None);
+        assert_eq!(map.nodes[0].epoch, 1, "the epoch it stood under");
+        assert_eq!(map.owner[0], Some(0));
+        assert_eq!(map.owner[5460], Some(0));
+        assert_eq!(map.owner[5461], Some(2), "somebody else's slots are theirs");
+    }
+
+    /// An election this node has no business holding is not held.
+    #[test]
+    fn a_replica_that_should_not_stand_does_not() {
+        let refused = |now: u64, set: fn(&Arc<Server>)| {
+            let server = shard();
+            {
+                let mut map = server.cluster.map.lock();
+                map.nodes[1].flags |= FLAG_FAIL;
+            }
+            set(&server);
+            let mut map = server.cluster.map.lock();
+            matches!(decide(&server, &mut map, now), Step::Idle)
+        };
+        // A master does not stand for election, whatever has happened to
+        // anybody else.
+        assert!(refused(T0, |server| {
+            let mut map = server.cluster.map.lock();
+            map.nodes[0].flags &= !FLAG_SLAVE;
+            map.nodes[0].flags |= FLAG_MASTER;
+        }));
+        // A replica that has been told not to.
+        assert!(refused(T0, |server| {
+            let mut map = server.cluster.map.lock();
+            map.nodes[0].flags |= FLAG_NOFAILOVER;
+        }));
+        // A master that was serving nothing has nothing to take over.
+        assert!(refused(T0, |server| {
+            let mut map = server.cluster.map.lock();
+            for slot in 0..=5460 {
+                map.owner[slot] = Some(2);
+            }
+        }));
+        // Data too old to be worth promoting. The link went down long enough
+        // ago that this node has missed more than a failover is allowed to
+        // lose, on top of the silence that made the master dead.
+        let stale = T0 + NODE_TIMEOUT_MS + STALE_DATA_MS + 1;
+        assert!(refused(stale, |server| {
+            server.pretend_following("10.0.0.1", 7001, false);
+            server.pretend_master_down_at(T0);
+        }));
+        // A second less and it stands, which is what makes the line above a
+        // test of the bound rather than of the setup.
+        assert!(!refused(stale - 1000, |server| {
+            server.pretend_following("10.0.0.1", 7001, false);
+            server.pretend_master_down_at(T0);
+        }));
     }
 
     #[test]
