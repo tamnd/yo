@@ -230,12 +230,6 @@ struct Packed {
     /// through [`Packed::step`] is written once and a hash without field TTL
     /// runs the same code a hash with it does.
     ex: bool,
-    /// A lower bound on the earliest deadline here, or [`NONE`].
-    ///
-    /// Leans early for the reason [`Deadlines::soonest`] gives: it goes down
-    /// when a deadline is set and does not go back up when one is taken off, so
-    /// [`Hash::reap`] can walk for nothing but cannot sleep through an expiry.
-    soonest: u64,
 }
 
 impl Packed {
@@ -243,8 +237,21 @@ impl Packed {
         Packed {
             lp: Listpack::new(),
             ex: false,
-            soonest: NONE,
         }
+    }
+
+    /// The earliest deadline here, or [`NONE`].
+    ///
+    /// The first row, because the rows are held in deadline order, so this is
+    /// exact and costs one element read. It used to be a bound carried in a
+    /// field beside the blob, which leant early and had to be repaired by a walk
+    /// after every reap, and ordering the rows made the field redundant and the
+    /// answer exact at the same time. Exact matters past tidiness: it is the
+    /// number that goes in front of a `HASH_LISTPACK_EX` payload, and a bound
+    /// that leant early put a different eight bytes there than a real server
+    /// writes for the same hash.
+    fn soonest(&self) -> u64 {
+        self.deadline(0).unwrap_or(NONE)
     }
 
     /// Two elements a field, or three once any field has a deadline.
@@ -280,11 +287,70 @@ impl Packed {
         }
     }
 
+    /// Where a row whose deadline is `deadline` belongs, as a row start.
+    ///
+    /// The first row that expires no earlier, or the end when nothing does. A
+    /// row with no deadline counts as expiring last, which is what puts the
+    /// fields that are not going anywhere behind the ones that are. Ties go in
+    /// front of the row they tie with, which is the side Redis inserts on.
+    ///
+    /// A row that is losing its deadline goes to the very end and not to the
+    /// front of the block that has none, which is the same end Redis appends it
+    /// to and is the only part of the order that is a choice rather than a
+    /// consequence: the rows with no deadline are in no order to be in.
+    fn place(&self, deadline: u64) -> usize {
+        if deadline == 0 {
+            return self.lp.len();
+        }
+        let mut at = 0;
+        while at < self.lp.len() {
+            match self.deadline(at) {
+                None => return at,
+                Some(here) if here >= deadline => return at,
+                Some(_) => at += 3,
+            }
+        }
+        self.lp.len()
+    }
+
     /// Write a deadline, or a zero for none, onto the row starting at `at`.
+    ///
+    /// The row moves, because this band is held in deadline order: soonest
+    /// first and the fields with no deadline at the end. That is Redis's layout
+    /// for the same blob and it is not only about the bytes matching. Order is
+    /// what makes reaping cheap, since the walk that drops expired fields stops
+    /// at the first row that is still alive rather than reading all of them, and
+    /// it is what makes the bound in the header free to keep. It is visible
+    /// through `HGETALL` and every other command that walks a hash in the order
+    /// it is stored, on both servers alike.
+    ///
+    /// A row that had no deadline and still has none does not move, which is the
+    /// common case: every `HSET` onto a widened hash comes through here and the
+    /// field it writes usually never had one.
     fn write_deadline(&mut self, at: usize, deadline: u64) {
         debug_assert!(self.ex, "widen before writing a deadline");
+        let was = self.deadline(at);
+        if was.is_none() && deadline == 0 {
+            return;
+        }
         let mut buf = [0u8; num::DIGITS_MAX];
-        self.lp.replace(at + 2, num::u64_digits(&mut buf, deadline));
+        let to = self.place(deadline);
+        // Already in the right place, and the only element that changes is the
+        // deadline itself, so overwrite it where it lies. `place` answers the
+        // row itself when the new deadline sorts exactly where the old one did.
+        if to == at || (deadline != 0 && to == at + 3) {
+            self.lp.replace(at + 2, num::u64_digits(&mut buf, deadline));
+            return;
+        }
+        let field = self.lp.get(at).map(owned).unwrap_or_default();
+        let value = self.lp.get(at + 1).map(owned).unwrap_or_default();
+        self.lp.delete(at, 3);
+        // Taking the row out moves everything behind it forward by one row, so
+        // a place that was behind it is now three elements nearer the front.
+        let to = if to > at { to - 3 } else { to };
+        self.lp.insert(to, &field);
+        self.lp.insert(to + 1, &value);
+        self.lp.insert(to + 2, num::u64_digits(&mut buf, deadline));
     }
 
     /// Store `value` against `field` and say whether the field is new.
@@ -332,22 +398,6 @@ impl Packed {
         self.ex = true;
     }
 
-    /// The earliest deadline actually here, or [`NONE`].
-    ///
-    /// A walk, so only [`Hash::reap`] calls it, and only once it has walked the
-    /// whole thing anyway and knows the bound it was carrying is stale.
-    fn earliest(&self) -> u64 {
-        let mut soonest = NONE;
-        let mut at = 0;
-        while at < self.lp.len() {
-            if let Some(deadline) = self.deadline(at) {
-                soonest = soonest.min(deadline);
-            }
-            at += self.step();
-        }
-        soonest
-    }
-
     /// Drop every field whose deadline has passed, and say how many went.
     fn reap(&mut self, now: u64, went: &mut impl FnMut(&[u8])) -> usize {
         let mut gone = 0;
@@ -385,6 +435,21 @@ impl Packed {
 /// A listpack holds something that looks like an integer as an integer, so the
 /// field `10` comes back out as a number and has to be turned back into the two
 /// bytes it was written as before anything compares or hashes it.
+/// A listpack element copied out, for a row that is about to be moved.
+///
+/// A move is a delete and an insert and the delete invalidates the bytes the
+/// insert wants, so the two elements that are not changing have to be held
+/// somewhere in between. Only ever called on the one row being repositioned.
+fn owned(t: Text<'_>) -> Vec<u8> {
+    match t {
+        Text::Str(s) => s.to_vec(),
+        Text::Int(n) => {
+            let mut digits = [0u8; num::DIGITS_MAX];
+            num::i64_digits(&mut digits, n).to_vec()
+        }
+    }
+}
+
 fn bytes_of<'a>(t: Text<'a>, digits: &'a mut [u8; num::DIGITS_MAX]) -> &'a [u8] {
     match t {
         Text::Str(s) => s,
@@ -640,11 +705,94 @@ impl Hash {
             return Err(lp);
         }
         Ok(Hash {
-            body: Body::Packed(Packed {
-                lp,
-                ex: false,
-                soonest: NONE,
-            }),
+            body: Body::Packed(Packed { lp, ex: false }),
+        })
+    }
+
+    /// The same, for a blob that carries a deadline beside every field.
+    ///
+    /// A `HASH_LISTPACK_EX` payload is byte for byte what the wider band holds,
+    /// so it moves in whole for the reason above, and the band comes back the
+    /// band it went out as rather than being rebuilt a field at a time into
+    /// whatever the fields happen to fit in. That matters past speed: a hash
+    /// that has been widened once stays widened on a real server even after
+    /// every deadline has come off again, so a reload that narrowed it would
+    /// change what `OBJECT ENCODING` answers.
+    ///
+    /// Refused when a row has already run out, so that the caller's walk can
+    /// drop those fields on the way past. Taking the blob whole would keep them,
+    /// and this band has nowhere to note that a row is dead.
+    pub(crate) fn from_packed_ex(
+        lp: Listpack,
+        limits: &Limits,
+        now: u64,
+    ) -> Result<Hash, Listpack> {
+        let n = lp.len();
+        if n == 0 || !n.is_multiple_of(3) {
+            return Err(lp);
+        }
+        let fields = n / 3;
+        if fields > limits.max_listpack_entries || fields > CHECK_MAX {
+            return Err(lp);
+        }
+        let mut marks = [0u64; CHECK_MAX];
+        let ok = {
+            let mut field_digits = [0u8; num::DIGITS_MAX];
+            let mut value_digits = [0u8; num::DIGITS_MAX];
+            let mut walk = lp.iter();
+            let mut i = 0;
+            let mut previous = 0u64;
+            let mut endless = false;
+            loop {
+                let Some(field) = walk.next() else { break true };
+                // The count is a multiple of three, checked above, so a field
+                // always has a value and a deadline behind it.
+                let (Some(value), Some(at)) = (walk.next(), walk.next()) else {
+                    break false;
+                };
+                let name = bytes_of(field, &mut field_digits);
+                if name.len() > limits.max_listpack_value {
+                    break false;
+                }
+                marks[i] = Elements::<u32>::hash_of(name);
+                i += 1;
+                if bytes_of(value, &mut value_digits).len() > limits.max_listpack_value {
+                    break false;
+                }
+                // A nought is a field with no deadline, which is the same
+                // spelling this band writes, and anything that is not a whole
+                // number of milliseconds is not a shape it can be in.
+                let Text::Int(at) = at else { break false };
+                let Ok(at) = u64::try_from(at) else {
+                    break false;
+                };
+                // The rows are held soonest first with the ones that have no
+                // deadline behind them, and this band goes on relying on that,
+                // so a blob that is not in that order is walked rather than
+                // taken whole. A real server never sends one that is not.
+                if at == 0 {
+                    endless = true;
+                } else {
+                    if endless || at < previous {
+                        break false;
+                    }
+                    if at <= now {
+                        break false;
+                    }
+                    previous = at;
+                }
+            }
+        };
+        if !ok {
+            return Err(lp);
+        }
+        let marks = &mut marks[..fields];
+        marks.sort_unstable();
+        if marks.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(lp);
+        }
+        Ok(Hash {
+            body: Body::Packed(Packed { lp, ex: true }),
         })
     }
 
@@ -675,6 +823,21 @@ impl Hash {
         }
     }
 
+    /// The same, for the band that carries a deadline beside every field.
+    ///
+    /// Two calls rather than one that says which band it found, because the two
+    /// go into an RDB under different type bytes with different things in front
+    /// of them, so a caller that got one answer would have to ask which it was
+    /// anyway. The blob is a listpack of field, value and deadline in that
+    /// order, with a nought where a field has none, which is Redis's
+    /// `listpackex` laid out the same way.
+    pub(crate) fn packed_ex_bytes(&self) -> Option<&[u8]> {
+        match &self.body {
+            Body::Packed(p) if p.ex => Some(p.lp.as_bytes()),
+            _ => None,
+        }
+    }
+
     /// Write this hash out as the bytes it comes back from.
     ///
     /// What a demotion turns the body into so the record can hold an address
@@ -698,7 +861,7 @@ impl Hash {
             }
             Body::Packed(p) => {
                 out.push(FORM_PACKED_EX);
-                frozen::put_uint(out, p.soonest);
+                frozen::put_uint(out, p.soonest());
                 out.extend_from_slice(p.lp.as_bytes());
             }
             Body::Table(t) => {
@@ -745,16 +908,18 @@ impl Hash {
                 body: Body::Packed(Packed {
                     lp: Listpack::from_bytes(cut.rest()).map_err(|_| Broken::Body)?,
                     ex: false,
-                    soonest: NONE,
                 }),
             }),
             FORM_PACKED_EX => {
-                let soonest = cut.uint()?;
+                // Read and dropped. The bound is still written, because the
+                // layout is on a device and not worth a version byte to save
+                // eight bytes a hash, and it is not read back because the first
+                // row says the same thing and cannot be stale.
+                let _ = cut.uint()?;
                 Ok(Hash {
                     body: Body::Packed(Packed {
                         lp: Listpack::from_bytes(cut.rest()).map_err(|_| Broken::Body)?,
                         ex: true,
-                        soonest,
                     }),
                 })
             }
@@ -886,7 +1051,11 @@ impl Hash {
         }
     }
 
-    /// Every field and its value, in insertion order.
+    /// Every field and its value, in the order they are stored.
+    ///
+    /// That is insertion order for a hash whose fields have no deadlines, and
+    /// soonest deadline first once any of them do, which is the order Redis
+    /// walks the same hash in.
     pub fn iter(&self) -> impl Iterator<Item = (Text<'_>, Text<'_>)> {
         (0..self.len()).map(|i| self.at(i).expect("index is under the length"))
     }
@@ -968,8 +1137,7 @@ impl Hash {
     #[must_use]
     pub fn soonest_deadline(&self) -> Option<u64> {
         match &self.body {
-            Body::Packed(p) if p.soonest == NONE => None,
-            Body::Packed(p) => Some(p.soonest),
+            Body::Packed(p) => Some(p.soonest()).filter(|&at| at != NONE),
             Body::Table(t) => t.ttl.soonest(),
         }
     }
@@ -995,13 +1163,7 @@ impl Hash {
             _ => return 0,
         }
         match &mut self.body {
-            Body::Packed(p) => {
-                let gone = p.reap(now, &mut went);
-                // The bound has been leaning early and this walk is the one that
-                // knows the truth, so it is the one that pays to fix it.
-                p.soonest = p.earliest();
-                gone
-            }
+            Body::Packed(p) => p.reap(now, &mut went),
             Body::Table(t) => {
                 let mut gone = 0;
                 let mut row = 0;
@@ -1049,7 +1211,6 @@ impl Hash {
                         }
                         let row = p.find(field).expect("widening kept every field");
                         p.write_deadline(row, at);
-                        p.soonest = p.soonest.min(at);
                     }
                     Applied::Deleted => {
                         p.remove_at(row);
@@ -1114,13 +1275,31 @@ impl Hash {
         }
     }
 
+    /// Make room for a deadline beside every field, whether one lands or not.
+    ///
+    /// The `HEXPIRE` family does this to a hash before it goes looking for the
+    /// fields it was given, so a call that names a field the hash does not hold
+    /// still leaves it in the wider band and `OBJECT ENCODING` still starts
+    /// saying `listpackex`. That is Redis's order, which converts the object
+    /// first and reads the fields after, and it is visible to a client on a
+    /// call that changed nothing else at all.
+    ///
+    /// Nothing to do on the table band, which is `hashtable` either way and
+    /// allocates its deadline column when a deadline arrives.
+    pub fn widen(&mut self) {
+        if let Body::Packed(p) = &mut self.body {
+            p.widen();
+        }
+    }
+
     /// Whether this hash is set up to carry field deadlines.
     ///
     /// Not the same question as whether any field has one now. Both bands widen
-    /// once, the first time a deadline lands on them, and neither narrows again
-    /// when the last one is taken off, so this is the thing that stays true for
-    /// as long as the hash is worth the active cycle's attention. See
-    /// [`crate::keyspace::Keyspace::field_expire_cycle`] for what asks.
+    /// once, the first time the `HEXPIRE` family is called on them, and neither
+    /// narrows again when the last deadline is taken off, so this is the thing
+    /// that stays true for as long as the hash is worth the active cycle's
+    /// attention. See [`crate::keyspace::Keyspace::field_expire_cycle`] for what
+    /// asks.
     #[must_use]
     pub fn takes_deadlines(&self) -> bool {
         match &self.body {
@@ -2198,7 +2377,89 @@ mod tests {
         assert_eq!(h.deadline_count(), 0);
         let back = round_trip(&h);
         assert_eq!(back.deadline_count(), 0);
-        assert_eq!(back.soonest_deadline(), Some(5000), "the bound only falls");
+        assert_eq!(
+            back.soonest_deadline(),
+            None,
+            "nothing here expires, and the rows say so"
+        );
+    }
+
+    /// The field names in the order the hash walks them.
+    fn names(h: &Hash) -> Vec<String> {
+        let mut digits = [0u8; num::DIGITS_MAX];
+        h.iter()
+            .map(|(f, _)| String::from_utf8_lossy(bytes_of(f, &mut digits)).into_owned())
+            .collect()
+    }
+
+    /// The wider band is held soonest deadline first, so setting one moves the
+    /// field it was set on. This is Redis's layout and it is what lets a reap
+    /// stop at the first row that is still alive.
+    #[test]
+    fn a_deadline_moves_its_field_up_the_hash() {
+        let mut h = filled(4, &SMALL);
+        assert_eq!(names(&h), ["f0", "f1", "f2", "f3"]);
+        h.expire(b"f2", 5000, Cond::Always, 0);
+        assert_eq!(names(&h), ["f2", "f0", "f1", "f3"]);
+        h.expire(b"f0", 3000, Cond::Always, 0);
+        assert_eq!(names(&h), ["f0", "f2", "f1", "f3"]);
+        // Soonest first the whole way along, with the fields that have none
+        // behind every field that has one.
+        assert_eq!(
+            (0..4).map(|i| h.deadline_at(i)).collect::<Vec<_>>(),
+            [Some(3000), Some(5000), None, None]
+        );
+    }
+
+    /// Moving a deadline later moves the field behind the ones that now expire
+    /// before it, and moving it earlier moves it back in front of them.
+    #[test]
+    fn changing_a_deadline_moves_the_field_again() {
+        let mut h = filled(3, &SMALL);
+        h.expire(b"f0", 1000, Cond::Always, 0);
+        h.expire(b"f1", 2000, Cond::Always, 0);
+        h.expire(b"f2", 3000, Cond::Always, 0);
+        assert_eq!(names(&h), ["f0", "f1", "f2"]);
+        h.expire(b"f0", 9000, Cond::Always, 0);
+        assert_eq!(names(&h), ["f1", "f2", "f0"]);
+        h.expire(b"f2", 500, Cond::Always, 0);
+        assert_eq!(names(&h), ["f2", "f1", "f0"]);
+        // The one that did not move is still holding what it was given.
+        assert_eq!(h.deadline(b"f1"), Ask::At(2000));
+        assert_eq!(h.deadline(b"f0"), Ask::At(9000));
+        assert_eq!(h.deadline(b"f2"), Ask::At(500));
+    }
+
+    /// Taking a deadline off puts the field at the very end, which is where a
+    /// field that never had one goes, and a write does the same thing since a
+    /// write clears the deadline.
+    #[test]
+    fn losing_a_deadline_sends_the_field_to_the_back() {
+        let mut h = filled(3, &SMALL);
+        h.expire(b"f0", 1000, Cond::Always, 0);
+        h.expire(b"f1", 2000, Cond::Always, 0);
+        assert_eq!(names(&h), ["f0", "f1", "f2"]);
+        assert_eq!(h.persist(b"f0"), Ask::At(1000));
+        assert_eq!(names(&h), ["f1", "f2", "f0"]);
+        h.set(b"f1", b"fresh", &SMALL);
+        assert_eq!(names(&h), ["f2", "f0", "f1"]);
+        assert_eq!(h.deadline_count(), 0);
+        // Nothing was lost on the way round, only moved.
+        assert_eq!(h.len(), 3);
+        assert_eq!(h.get(b"f1"), Some(Text::Str(b"fresh")));
+        assert_eq!(h.get(b"f0"), Some(Text::Str(b"v0")));
+    }
+
+    /// A field written onto a hash that has already widened is a plain append,
+    /// since it has no deadline, and the rows in front of it do not move.
+    #[test]
+    fn a_fresh_field_lands_behind_the_ones_with_deadlines() {
+        let mut h = filled(2, &SMALL);
+        h.expire(b"f1", 4000, Cond::Always, 0);
+        h.set(b"f9", b"v9", &SMALL);
+        assert_eq!(names(&h), ["f1", "f0", "f9"]);
+        h.expire(b"f9", 100, Cond::Always, 0);
+        assert_eq!(names(&h), ["f9", "f1", "f0"]);
     }
 
     #[test]
