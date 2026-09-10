@@ -788,13 +788,21 @@ fn emit(server: &Server, bytes: Vec<u8>) {
 /// Put one command on the stream, with a `SELECT` in front of it if the stream
 /// is not on the right database.
 fn send(server: &Server, db: usize, parts: &[&[u8]]) {
+    let body = render(parts);
+    // A slot migration listens here as well, because this is the one place
+    // everything propagated comes through: a rewrite, a key that went away on
+    // its own, what a script did. It takes the command already rendered and
+    // keeps or drops it on the slot its key is in, and it never gets the
+    // `SELECT` below, since a cluster has one database and the far side would
+    // have nothing to do with it.
+    server.asm_feed(&body);
     let mut bytes = Vec::new();
     if server.repl.on_db.load(Relaxed) != db as i64 {
         let n = db.to_string();
         bytes = render(&[b"SELECT", n.as_bytes()]);
         server.repl.on_db.store(db as i64, Relaxed);
     }
-    bytes.extend_from_slice(&render(parts));
+    bytes.extend_from_slice(&body);
     emit(server, bytes);
 }
 
