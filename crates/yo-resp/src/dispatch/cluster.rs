@@ -2221,6 +2221,21 @@ fn setslot(server: &Server, session_db: usize, args: Args<'_>, out: &mut Out) ->
         ));
     }
     let slot = slot_arg(&args, 2)?;
+    // A slot an atomic migration is moving is not one to hand over by hand. The
+    // two ways of moving a slot write the same three fields from two directions,
+    // and the migration would finish by claiming a slot the operator had already
+    // given to somebody else. Cancelling the task is the way out and the sentence
+    // says so, because a resharding tool is what reads it.
+    if server.cluster.asm.in_task(slot) {
+        return Err(Error::fmt(
+            Code::Invalid,
+            format_args!(
+                "Slot {slot} is currently in an active atomic slot migration. \
+                 CLUSTER SETSLOT cannot be used at this time. To perform a legacy slot migration \
+                 instead, first cancel the ongoing task with CLUSTER MIGRATION CANCEL"
+            ),
+        ));
+    }
     let action = args.get(3);
     let wrong = || {
         Error::new(
@@ -2877,6 +2892,86 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::{SLOTS, key_slot};
+
+    /// The two ways of moving a slot write the same three fields, so a slot an
+    /// atomic migration is moving is refused to the old way by name.
+    ///
+    /// The sentence is compared against the one a real 8.10.1 sends, because a
+    /// resharding tool is what reads it and the way out of the situation is
+    /// named in it.
+    #[test]
+    fn setslot_will_not_touch_a_slot_a_migration_is_moving() {
+        use crate::proto::{Limits, Proto};
+        use crate::reply::Out;
+        use crate::request::{Argv, Step};
+
+        let mut server = super::Server::new();
+        server.enable_cluster("", 7000);
+        server.cluster_own_everything();
+        let other = server.cluster_pretend_node(
+            "5b1e2ce29b1e0c86bd53ee1e5b0dd7b66c0e6e0f",
+            "10.0.0.9",
+            7002,
+        );
+        assert_eq!(other, 1);
+
+        let said = |server: &super::Server, argv: &[&[u8]]| {
+            let mut wire = Vec::new();
+            wire.extend_from_slice(format!("*{}\r\n", argv.len()).as_bytes());
+            for arg in argv {
+                wire.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+                wire.extend_from_slice(arg);
+                wire.extend_from_slice(b"\r\n");
+            }
+            let mut decoded = Argv::new();
+            assert!(matches!(
+                decoded.decode(&wire, &Limits::default()).unwrap(),
+                Step::Command { .. }
+            ));
+            let args = super::Args::new(&decoded, &wire);
+            let mut out = Out::new(Proto::Resp2);
+            match super::setslot(server, 0, args, &mut out) {
+                Ok(()) => String::from_utf8_lossy(out.as_slice()).into_owned(),
+                Err(e) => e.to_string(),
+            }
+        };
+
+        // Nothing is moving, so the old way works.
+        assert_eq!(
+            said(&server, &[b"CLUSTER", b"SETSLOT", b"100", b"STABLE"]),
+            "+OK\r\n"
+        );
+
+        server
+            .asm_begin_import(vec![b'b'; 40], vec![(100, 200)])
+            .expect("nothing else is running");
+        for slot in [b"100".as_slice(), b"150", b"200"] {
+            let got = said(&server, &[b"CLUSTER", b"SETSLOT", slot, b"STABLE"]);
+            let want = format!(
+                "Slot {} is currently in an active atomic slot migration. \
+                 CLUSTER SETSLOT cannot be used at this time. To perform a legacy slot migration \
+                 instead, first cancel the ongoing task with CLUSTER MIGRATION CANCEL",
+                String::from_utf8_lossy(slot)
+            );
+            assert!(got.ends_with(&want), "{got:?}");
+        }
+        // Either side of the range is untouched, since only the slots actually
+        // moving are the ones there are two writers for.
+        assert_eq!(
+            said(&server, &[b"CLUSTER", b"SETSLOT", b"99", b"STABLE"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            said(&server, &[b"CLUSTER", b"SETSLOT", b"201", b"STABLE"]),
+            "+OK\r\n"
+        );
+        // And the gate goes when the task does.
+        server.cluster.asm.cancel(None, 1);
+        assert_eq!(
+            said(&server, &[b"CLUSTER", b"SETSLOT", b"150", b"STABLE"]),
+            "+OK\r\n"
+        );
+    }
 
     /// The slots the reference answered for these keys, read off a running
     /// 8.10.1 with cluster mode on rather than worked out from the algorithm.
