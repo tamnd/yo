@@ -366,6 +366,14 @@ pub(super) struct Task {
     rdb_state: State,
     /// When writes stopped for the handoff, or nought if they have not.
     paused: i64,
+    /// When the far side started reading the snapshot, or nought before that.
+    ///
+    /// Only ever read as the start of the span the drain deadline is worked out
+    /// from, and only on the giving up side.
+    snapshot_at: i64,
+    /// When the far side first said it had worked through everything that piled
+    /// up behind the snapshot, or nought if it has not said so yet.
+    drained_at: i64,
 }
 
 impl Task {
@@ -536,6 +544,19 @@ impl Asm {
             .find(|range| overlapping(&task.slots, &[*range]))
     }
 
+    /// Whether a slot is one the migration running right now is moving.
+    ///
+    /// The reference's `isSlotInAsmTask`, and it is what stops the two ways of
+    /// moving a slot being used on the same slot at once. Only the live task
+    /// counts, since a finished one is not moving anything.
+    pub(super) fn in_task(&self, slot: u16) -> bool {
+        let tasks = self.inner.lock();
+        tasks
+            .live
+            .as_ref()
+            .is_some_and(|task| overlapping(&task.slots, &[(slot, slot)]))
+    }
+
     /// Cancel the live task if it is the one named, and say whether it was.
     ///
     /// `None` means every task, which is what `CANCEL ALL` sends. A finished
@@ -566,12 +587,17 @@ impl Asm {
     }
 
     /// Start sending changes, which the snapshot does from inside its freeze.
-    fn start_stream(&self) {
+    fn start_stream(&self, now: i64) {
         let mut tasks = self.inner.lock();
         if let Some(task) = tasks.live.as_mut()
             && task.state == State::WaitBgsaveStart
         {
             task.state = State::SendStream;
+            // The far side is reading the snapshot from this moment, and how
+            // long it takes to get through that and the changes piled up behind
+            // it is what the drain deadline is measured against.
+            task.snapshot_at = now;
+            task.dest_state = State::AccumulateBuf;
             // The snapshot has been read by the time this runs and there is no
             // moment at which it is half sent, so the connection it goes down is
             // done with as far as anything that reads this is concerned. It is
@@ -636,7 +662,7 @@ impl Asm {
     /// slots over. That is done outside this lock because it freezes the server
     /// and holding a lock the status command wants across a freeze would mean
     /// nobody could even ask what the migration was doing.
-    fn ack(&self, conn: u64, state: State, offset: u64) -> bool {
+    fn ack(&self, conn: u64, state: State, offset: u64, now: i64) -> bool {
         let mut tasks = self.inner.lock();
         let Some(task) = tasks.live.as_mut() else {
             return false;
@@ -645,6 +671,13 @@ impl Asm {
             return false;
         }
         task.dest_state = state;
+        // The first time the far side says it has caught up with the pile is
+        // where the drain deadline starts counting, and it is only the first
+        // time, because everything after that is the far side following the
+        // stream rather than working through a backlog.
+        if state == State::WaitStreamEof && task.drained_at == 0 {
+            task.drained_at = now;
+        }
         // Backwards is not an error and not a state to act on. The reference
         // logs it and carries on, because the far side reconnecting and starting
         // its count again is a thing that happens and the older number is simply
@@ -724,6 +757,42 @@ impl Asm {
                 "Write pause timeout during slot handoff: destination did not take ownership within {timeout} ms."
             )
         }));
+        task.state = State::Failed;
+        self.retire(&mut tasks, now);
+        true
+    }
+
+    /// Give up on a far side that says it has caught up and never does, which is
+    /// the reference's `cluster-slot-migration-sync-buffer-drain-timeout`.
+    ///
+    /// The shape it catches is a move that never ends rather than one that
+    /// breaks. The far side works through everything that piled up behind the
+    /// snapshot and says so, but the gap between what it has taken and what has
+    /// been sent since stays wider than a handoff is allowed to start at, because
+    /// this node is taking writes faster than that side can apply them. Nothing
+    /// is wrong with either end and left alone it would run until somebody
+    /// noticed.
+    ///
+    /// The deadline is the longer of the setting and twice however long the far
+    /// side took to get through the snapshot and the pile, since a side that
+    /// needed a minute for the first part is not one to give ten seconds to for
+    /// the rest. Doubling it is the reference's margin.
+    fn drain_expired(&self, now: i64, timeout: i64) -> bool {
+        let mut tasks = self.inner.lock();
+        let Some(task) = tasks.live.as_mut() else {
+            return false;
+        };
+        if task.state != State::SendStream
+            || task.dest_state != State::WaitStreamEof
+            || task.drained_at == 0
+        {
+            return false;
+        }
+        let caught_up = (task.drained_at - task.snapshot_at).max(0) * 2;
+        if now - task.drained_at <= timeout.max(caught_up) {
+            return false;
+        }
+        task.blame("Sync buffer drain timeout");
         task.state = State::Failed;
         self.retire(&mut tasks, now);
         true
@@ -922,6 +991,8 @@ impl Server {
             acked: 0,
             dest_state: State::None,
             paused: 0,
+            snapshot_at: 0,
+            drained_at: 0,
             rdb_state: State::None,
         });
         Ok(())
@@ -978,6 +1049,8 @@ impl Server {
             acked: 0,
             dest_state: State::None,
             paused: 0,
+            snapshot_at: 0,
+            drained_at: 0,
             rdb_state: State::None,
         });
         Ok(id)
@@ -1098,7 +1171,7 @@ impl Server {
         let (image, _at) = self.at_an_instant(|| {
             let mut out = Out::with_capacity(Proto::Resp2, 4096);
             self.write_snapshot(slots, &mut out);
-            self.cluster.asm.start_stream();
+            self.cluster.asm.start_stream(self.now_ms() as i64);
             out.into_inner()
         });
         image
@@ -1206,7 +1279,11 @@ impl Server {
         let Some(state) = State::dest_word(state) else {
             return;
         };
-        if self.cluster.asm.ack(conn, state, offset) {
+        if self
+            .cluster
+            .asm
+            .ack(conn, state, offset, self.now_ms() as i64)
+        {
             self.asm_handoff();
         }
     }
@@ -1256,12 +1333,13 @@ impl Server {
     /// is allowed to is given up on. The far side is not told, because the only
     /// connection to it is the one it is expected to close.
     pub(crate) fn asm_cron(&self) {
+        let now = self.now_ms() as i64;
         let timeout = self.migration_knob(Migration::Pause).max(0);
-        if self
-            .cluster
-            .asm
-            .pause_expired(self.now_ms() as i64, timeout)
-        {
+        if self.cluster.asm.pause_expired(now, timeout) {
+            self.asm_relax();
+        }
+        let drain = self.migration_knob(Migration::Drain).max(0);
+        if self.cluster.asm.drain_expired(now, drain) {
             self.asm_relax();
         }
     }
@@ -1885,6 +1963,63 @@ mod tests {
         // A migration that failed reports no pause, however long it held the
         // server, because the number is only for one that got through.
         assert!(got.contains("write_pause_ms\r\n:0\r\n"), "{got:?}");
+    }
+
+    /// A far side that says it has caught up and then falls behind again for
+    /// good does not get to keep a migration open forever.
+    #[test]
+    fn a_far_side_that_never_drains_gives_up() {
+        let server = node();
+        let id = [b'b'; 40];
+        server
+            .asm_begin_migrate(&id, &[b'c'; 40], vec![(0, 16383)], &wire(7))
+            .expect("nothing else is running");
+        server
+            .asm_take_rdb_channel(&id, 8)
+            .expect("the task is waiting for it");
+        server.asm_snapshot(&[(0, 16383)]);
+        {
+            let mut tasks = server.cluster.asm.inner.lock();
+            tasks.live.as_mut().unwrap().sent = LAG * 10;
+        }
+        let state = |server: &Server| server.cluster.asm.inner.lock().live.as_ref().unwrap().state;
+        // Caught up with the pile, and still far enough behind the stream that
+        // the handoff cannot start.
+        server.asm_ack(7, b"wait-stream-eof", LAG);
+        assert_eq!(state(&server), State::SendStream);
+        server.asm_cron();
+        assert_eq!(state(&server), State::SendStream, "nothing is late yet");
+        // A later acknowledgement does not push the deadline back, because the
+        // span being measured starts where the backlog ended.
+        server.asm_ack(7, b"wait-stream-eof", LAG * 2);
+        {
+            let mut tasks = server.cluster.asm.inner.lock();
+            let task = tasks.live.as_mut().unwrap();
+            task.drained_at -= super::DRAIN + 1;
+            // And the snapshot took long enough that twice it is the longer of
+            // the two, so the deadline is that instead of the setting.
+            task.snapshot_at = task.drained_at - super::DRAIN;
+        }
+        server.asm_cron();
+        assert_eq!(state(&server), State::SendStream, "given the longer span");
+        {
+            let mut tasks = server.cluster.asm.inner.lock();
+            let task = tasks.live.as_mut().unwrap();
+            task.snapshot_at = task.drained_at;
+        }
+        server.asm_cron();
+        let mut out = Out::new(Proto::Resp3);
+        server.cluster.asm.report_one(&id, &mut out);
+        let got = text(&out);
+        assert!(
+            got.contains(
+                "Sync buffer drain timeout (state: send-stream, rdb_channel_state: completed)"
+            ),
+            "{got:?}"
+        );
+        assert!(got.contains("$6\r\nfailed\r\n"), "{got:?}");
+        // And the stream stops, since there is nobody left to send it to.
+        assert!(!server.propagating());
     }
 
     /// Cancelling a migration that has stopped the writes starts them again,
