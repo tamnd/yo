@@ -31,12 +31,8 @@
 //!
 //! # What is not here
 //!
-//! The manual failover. `MFSTART` is recognised and dropped rather than
-//! answered, so a real server's replica that is asked to take over by hand
-//! waits its five seconds out and gives up, and `CLUSTER FAILOVER` here is
-//! still refused. The vote it would use is in, since the same election runs
-//! whether the master died or is being stood down, and the flag that says the
-//! master is up and in on it is honoured on the side being asked.
+//! Modules, which are not a thing in this server at all, so the packet type that
+//! carries a module message between nodes is recognised and dropped.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -46,6 +42,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use yo_common::lock::Lock;
+use yo_common::{Code, Error};
 
 use super::super::Server;
 use super::super::pubsub::{self, Kind};
@@ -132,6 +129,14 @@ const T_MFSTART: u16 = 8;
 const T_MODULE: u16 = 9;
 const T_PUBLISHSHARD: u16 = 10;
 
+/// The message flag a master sets on everything it sends while it is holding its
+/// clients still for a manual failover.
+///
+/// It is what turns the offset in the header into a promise: a header with this
+/// on says nothing has been written since that offset and nothing will be, so a
+/// replica that has caught up to it has caught up for good.
+const MF_PAUSED: u8 = 1;
+
 /// The message flag that says vote for me even though my master is up, which is
 /// the only thing that makes a manual failover different from any other on the
 /// side being asked.
@@ -217,6 +222,28 @@ const ELECTION_TIMEOUT_MS: u64 = if NODE_TIMEOUT_MS * 2 > 2000 {
 /// letting the shard stay down does.
 const STALE_DATA_MS: u64 = 10_000 + NODE_TIMEOUT_MS * 10;
 
+/// How long a manual failover has to finish before it is written off.
+///
+/// The reference's `CLUSTER_MF_TIMEOUT`. It is short because everything it is
+/// waiting for is quick: a packet to the master, the master stopping its writes,
+/// and one round of replication to catch this node up on whatever was already in
+/// flight. If that has not happened in five seconds it is not going to.
+const MANUAL_TIMEOUT_MS: u64 = 5000;
+
+/// How much longer than that the master holds its clients still.
+///
+/// The reference's `CLUSTER_MF_PAUSE_MULT`, and the reason it is longer is that
+/// the master has to still be holding them when the replica gives up, or the
+/// window it was there to close would open again at exactly the wrong moment.
+const MANUAL_PAUSE_MULT: u64 = 2;
+
+/// What the master's offset reads as before the master has said what it is.
+///
+/// The reference uses minus one in a signed field. A real offset can be any
+/// value a `u64` holds except this one, which needs a stream longer than the age
+/// of the universe to reach.
+const OFFSET_UNKNOWN: u64 = u64::MAX;
+
 /// The election this node is standing in or voting in.
 ///
 /// Atomics rather than a lock because they are read from the cron and written
@@ -251,6 +278,38 @@ impl Vote {
     /// Put back what the config file said, which is why the file has it.
     pub(super) fn reload(&self, epoch: u64) {
         self.given.store(epoch, Relaxed);
+    }
+}
+
+/// The manual failover this node is in, on whichever side of it.
+///
+/// The same four words serve the replica that asked and the master that was
+/// asked, because a node is only ever on one side of one of these at a time and
+/// `held` says which side that is. Nothing here is on disk: a manual failover
+/// that was interrupted by a restart is one nobody is waiting for any more.
+pub(super) struct Manual {
+    /// When this is given up on, or nought when there is not one running.
+    end: AtomicU64,
+    /// Whether the replica may stand now, which on this path means at once and
+    /// without any of the waiting an automatic failover does.
+    can_start: AtomicBool,
+    /// The offset the master had when it stopped taking writes, or
+    /// [`OFFSET_UNKNOWN`] before it has said.
+    offset: AtomicU64,
+    /// On the master, the deadline of the pause it armed, which is both how it
+    /// lifts exactly that pause afterwards and how this node knows it is the
+    /// master here rather than the replica.
+    held: AtomicU64,
+}
+
+impl Default for Manual {
+    fn default() -> Manual {
+        Manual {
+            end: AtomicU64::new(0),
+            can_start: AtomicBool::new(false),
+            offset: AtomicU64::new(OFFSET_UNKNOWN),
+            held: AtomicU64::new(0),
+        }
     }
 }
 
@@ -751,6 +810,12 @@ fn header(server: &Server, map: &Map, kind: u16) -> Vec<u8> {
         STATE_FAIL
     };
     p[O_MFLAGS] = MF_EXT_DATA;
+    // A master in the middle of a manual failover says so on everything it
+    // sends, which is what tells the replica that the offset above is the last
+    // one there will ever be.
+    if map.nodes[0].is_master() && server.cluster.manual.end.load(Relaxed) != 0 {
+        p[O_MFLAGS] |= MF_PAUSED;
+    }
     p
 }
 
@@ -1073,6 +1138,19 @@ fn digest(
             todo.save = true;
         }
         node.offset = be64(p, O_OFFSET);
+        // A manual failover this node asked for, and the answer to the only
+        // question it was waiting on: where the master stopped. The first paused
+        // header is the one that counts, because the ones after it say the same
+        // thing and taking a later one would only move the target.
+        let manual = &server.cluster.manual;
+        if manual.end.load(Relaxed) != 0
+            && manual.offset.load(Relaxed) == OFFSET_UNKNOWN
+            && map.nodes[0].flags & FLAG_SLAVE != 0
+            && map.nodes[0].master == Some(at)
+            && p.get(O_MFLAGS).is_some_and(|f| f & MF_PAUSED != 0)
+        {
+            manual.offset.store(be64(p, O_OFFSET), Relaxed);
+        }
     }
 
     if kind == T_PING || kind == T_MEET {
@@ -1210,10 +1288,14 @@ fn digest(
             }
             return;
         }
-        // Manual failover is not in yet, so the request to pause is dropped and
-        // a real server's replica asking for one simply waits it out. Modules
-        // are not a thing here at all.
-        T_MFSTART | T_MODULE => return,
+        T_MFSTART => {
+            if let Some(at) = sender {
+                stand_down(server, map, at, now, todo);
+            }
+            return;
+        }
+        // Modules are not a thing here at all.
+        T_MODULE => return,
         _ => return,
     }
 
@@ -1700,6 +1782,10 @@ fn claim_slots(
     // makes a failed master come back as a replica of whoever replaced it.
     if lost > 0 && ours.is_some_and(|at| map.runs(at).is_empty()) && owner != 0 {
         todo.demoted = true;
+        // Whoever took them is the node this one was standing down for, if it
+        // was standing down at all, so the pause it armed goes now rather than
+        // when the clock runs out.
+        manual_reset(server);
         map.nodes[0].flags &= !FLAG_MASTER;
         map.nodes[0].flags |= FLAG_SLAVE;
         map.nodes[0].master = Some(owner);
@@ -1830,36 +1916,56 @@ enum Step {
 /// most one step.
 fn decide(server: &Arc<Server>, map: &mut Map, now: u64) -> Step {
     let vote = &server.cluster.vote;
+    let manual = &server.cluster.manual;
+    // A manual failover is one somebody asked for on this node, and once it is
+    // ready it is allowed three things an automatic one is not: it does not need
+    // the master to be gone, it ignores the flag that says this node would
+    // rather not stand, and it does not care how far behind the data is. All
+    // three are safe for the same reason, which is that the master is holding
+    // its clients still and this node has caught up with everything it wrote.
+    let asked = manual.end.load(Relaxed) != 0;
+    let ready = asked && manual.can_start.load(Relaxed);
     // A replica of a master the cluster has given up on, which is willing to be
     // promoted, and whose master was serving something worth taking over.
     let me = &map.nodes[0];
-    if me.flags & (FLAG_SLAVE | FLAG_NOFAILOVER) != FLAG_SLAVE {
+    if me.flags & FLAG_SLAVE == 0 || (me.flags & FLAG_NOFAILOVER != 0 && !ready) {
         return Step::Idle;
     }
     let Some(master) = me.master else {
         return Step::Idle;
     };
-    if map.nodes[usize::from(master)].flags & FLAG_FAIL == 0 || map.runs(master).is_empty() {
+    if map.nodes[usize::from(master)].flags & FLAG_FAIL == 0 && !ready {
+        return Step::Idle;
+    }
+    if map.runs(master).is_empty() {
         return Step::Idle;
     }
     // How far out of touch with the master this node was before it died. The
     // node timeout comes off because that much silence is what made it dead in
     // the first place and is not the replica's fault.
-    if server.master_silence(now).saturating_sub(NODE_TIMEOUT_MS) > STALE_DATA_MS {
+    if !ready && server.master_silence(now).saturating_sub(NODE_TIMEOUT_MS) > STALE_DATA_MS {
         return Step::Idle;
     }
     let since = now as i64 - vote.at.load(Relaxed) as i64;
     if since > (ELECTION_TIMEOUT_MS * 2) as i64 {
         // Nothing running, or the last one is long enough ago to try again. The
         // delay is a fixed part, a random part and a part per replica that holds
-        // more data than this one.
-        let rank = rank_of(map, master, server.repl_offset());
-        vote.at.store(
+        // more data than this one. None of that applies to a manual failover:
+        // there is nothing to let propagate, nobody else is standing, and the
+        // operator is waiting, so it goes now and at the front of the queue.
+        let rank = if asked {
+            0
+        } else {
+            rank_of(map, master, server.repl_offset())
+        };
+        let at = if asked {
+            now
+        } else {
             now + ELECTION_DELAY_MS
                 + u64::from(pick(ELECTION_DELAY_MS as usize))
-                + rank * RANK_DELAY_MS,
-            Relaxed,
-        );
+                + rank * RANK_DELAY_MS
+        };
+        vote.at.store(at, Relaxed);
         vote.rank.store(rank, Relaxed);
         vote.count.store(0, Relaxed);
         vote.sent.store(false, Relaxed);
@@ -1870,12 +1976,15 @@ fn decide(server: &Arc<Server>, map: &mut Map, now: u64) -> Step {
         // out. Falling further down the order pushes the delay back, and
         // climbing it does not pull it forward, which is the reference's rule
         // and is what keeps two replicas swapping places from both asking at
-        // once.
-        let rank = rank_of(map, master, server.repl_offset());
-        let was = vote.rank.load(Relaxed);
-        if rank > was {
-            vote.at.fetch_add((rank - was) * RANK_DELAY_MS, Relaxed);
-            vote.rank.store(rank, Relaxed);
+        // once. Not done on a manual failover, where the delay is nought and
+        // there is no order to fall down.
+        if !asked {
+            let rank = rank_of(map, master, server.repl_offset());
+            let was = vote.rank.load(Relaxed);
+            if rank > was {
+                vote.at.fetch_add((rank - was) * RANK_DELAY_MS, Relaxed);
+                vote.rank.store(rank, Relaxed);
+            }
         }
         if now < vote.at.load(Relaxed) {
             return Step::Idle;
@@ -1891,6 +2000,11 @@ fn decide(server: &Arc<Server>, map: &mut Map, now: u64) -> Step {
         vote.epoch.store(epoch, Relaxed);
         vote.sent.store(true, Relaxed);
         let mut packet = header(server, map, T_AUTH_REQUEST);
+        // The master is up and is in on it, so say so, or every master asked
+        // would refuse on the grounds that there is nothing wrong with it.
+        if asked {
+            packet[O_MFLAGS] |= MF_FORCEACK;
+        }
         seal(&mut packet);
         return Step::Ask(packet);
     }
@@ -1898,12 +2012,20 @@ fn decide(server: &Arc<Server>, map: &mut Map, now: u64) -> Step {
         return Step::Idle;
     }
     let epoch = vote.epoch.load(Relaxed);
+    replace_master(map, master, epoch);
+    Step::Won
+}
+
+/// Take everything the master was serving, under an epoch nobody else has used.
+///
+/// The reference's `clusterFailoverReplaceYourMaster` as far as the table goes,
+/// and the epoch is what makes every other node believe this over whatever it
+/// had written down. The caller has already made sure of the epoch, either by
+/// winning an election under it or by bumping it on its own.
+fn replace_master(map: &mut Map, master: u16, epoch: u64) {
     if map.nodes[0].epoch < epoch {
         map.nodes[0].epoch = epoch;
     }
-    // Everything the old master was serving is this node's now, and saying so
-    // under an epoch nobody else has used is what makes every other node believe
-    // it over whatever it had written down.
     map.nodes[0].flags &= !FLAG_SLAVE;
     map.nodes[0].flags |= FLAG_MASTER;
     map.nodes[0].master = None;
@@ -1912,7 +2034,16 @@ fn decide(server: &Arc<Server>, map: &mut Map, now: u64) -> Step {
             map.owner[slot] = Some(0);
         }
     }
-    Step::Won
+}
+
+/// The half of taking over that cannot be done while the table is locked.
+fn won(server: &Arc<Server>) {
+    server.stop_following();
+    manual_reset(server);
+    server.recount_coverage();
+    server.cluster.bus.dirty.store(true, Relaxed);
+    let _ = super::save(server);
+    server.cluster_broadcast_pong();
 }
 
 /// Stand for election when the master is gone, and take over on winning.
@@ -1933,14 +2064,158 @@ fn failover(server: &Arc<Server>, now: u64) {
             }
             server.cluster.bus.dirty.store(true, Relaxed);
         }
-        Step::Won => {
-            server.stop_following();
-            server.recount_coverage();
-            server.cluster.bus.dirty.store(true, Relaxed);
-            let _ = super::save(server);
-            server.cluster_broadcast_pong();
+        Step::Won => won(server),
+    }
+}
+
+// ------------------------------------------------------- the manual failover
+
+/// Forget any manual failover, lifting the pause if this node armed one.
+///
+/// The reference's `resetManualFailover`, and it is called on every way out of
+/// one: the timeout, the takeover, winning, and being stood down by the node
+/// that replaced this one. A master that is left holding a pause it armed for a
+/// failover that never happened is the one outcome worth going out of the way to
+/// avoid, since from a client it looks exactly like the server having stopped.
+fn manual_reset(server: &Server) {
+    let manual = &server.cluster.manual;
+    let held = manual.held.swap(0, Relaxed);
+    if held != 0 {
+        server.lift(held, false);
+    }
+    manual.end.store(0, Relaxed);
+    manual.can_start.store(false, Relaxed);
+    manual.offset.store(OFFSET_UNKNOWN, Relaxed);
+}
+
+/// A replica has asked this node to stand down, which is the reference's
+/// `MFSTART` arm and is the whole of the master's part in a manual failover.
+///
+/// It stops taking writes and says where it stopped, and everything after that
+/// is the replica's problem. The pause is what makes the whole thing worth
+/// having: without it the replica would be chasing an offset that kept moving
+/// and would either never catch up or take over having missed something.
+fn stand_down(server: &Arc<Server>, map: &Map, at: u16, now: u64, todo: &mut Todo) {
+    // Only from one of this node's own replicas, because holding every client
+    // on this server still is a large thing to be talked into and the only node
+    // it helps is one that is about to replace this one.
+    let asking = &map.nodes[usize::from(at)];
+    if asking.master != Some(0) || asking.flags & FLAG_SLAVE == 0 || !map.nodes[0].is_master() {
+        return;
+    }
+    // A slot migration and a failover both decide who owns a slot, and running
+    // them at once is the one way to end up with two answers. The migration is
+    // the one that gets dropped, because it can be started again and a failover
+    // that is already under way cannot.
+    server.cluster.asm.cancel(None, now as i64);
+    manual_reset(server);
+    let manual = &server.cluster.manual;
+    manual.end.store(now + MANUAL_TIMEOUT_MS, Relaxed);
+    let until = now + MANUAL_TIMEOUT_MS * MANUAL_PAUSE_MULT;
+    manual.held.store(until, Relaxed);
+    server.pause(until, false);
+    // Answered at once rather than left to the cron, because the ping carries
+    // the offset the writes stopped at and that is the only thing the replica
+    // is waiting for.
+    yo_alloc::allow(|| todo.reply.push(ping(server, map, T_PING, Some(at))));
+}
+
+/// Move a manual failover along by one tick, on whichever side of it this is.
+///
+/// The reference's `manualFailoverCheckTimeout` and `clusterHandleManualFailover`
+/// in one, since they run one after the other and share every condition. All the
+/// replica is waiting for is its own offset to reach the one the master stopped
+/// at, and all the master is waiting for is somebody to take its slots off it or
+/// the clock to run out.
+fn manual_cron(server: &Arc<Server>, now: u64) {
+    let manual = &server.cluster.manual;
+    let end = manual.end.load(Relaxed);
+    if end == 0 {
+        return;
+    }
+    if end < now {
+        manual_reset(server);
+        return;
+    }
+    if manual.can_start.load(Relaxed) {
+        return;
+    }
+    let offset = manual.offset.load(Relaxed);
+    if offset != OFFSET_UNKNOWN && offset == server.repl_offset() {
+        // Everything the master wrote is here, and nothing more is coming. This
+        // is the moment a manual failover is safe, and it is the only moment,
+        // which is why the whole handshake exists.
+        manual.can_start.store(true, Relaxed);
+    }
+}
+
+/// `CLUSTER FAILOVER [FORCE|TAKEOVER]`, which is the reference's checks and then
+/// one of its three ways of going about it.
+///
+/// The plain form asks the master to hold its clients still and waits for the
+/// two offsets to meet, which is the only form that cannot lose a write. `FORCE`
+/// skips the asking, which is for a master that is up but not answering, and
+/// loses whatever it had not sent yet. `TAKEOVER` skips the election as well and
+/// simply says this node owns the slots now under an epoch it made up, which is
+/// for a cluster that has lost too many masters to hold an election at all.
+pub(super) fn manual_failover(
+    server: &Arc<Server>,
+    force: bool,
+    takeover: bool,
+) -> Result<(), Error> {
+    let now = server.now_ms();
+    let mut ask: Option<(String, Vec<u8>)> = None;
+    let mut promoted = false;
+    {
+        let mut map = server.cluster.map.lock();
+        if map.nodes[0].is_master() {
+            return Err(Error::new(
+                Code::Invalid,
+                "You should send CLUSTER FAILOVER to a replica",
+            ));
+        }
+        let Some(master) = map.nodes[0].master else {
+            return Err(Error::new(
+                Code::Invalid,
+                "I'm a replica but my master is unknown to me",
+            ));
+        };
+        let node = &map.nodes[usize::from(master)];
+        if !force && (node.flags & FLAG_FAIL != 0 || !node.linked) {
+            return Err(Error::new(
+                Code::Invalid,
+                "Master is down or failed, please use CLUSTER FAILOVER FORCE",
+            ));
+        }
+        manual_reset(server);
+        server
+            .cluster
+            .manual
+            .end
+            .store(now + MANUAL_TIMEOUT_MS, Relaxed);
+        if takeover {
+            super::bump_without_consensus(server, &mut map);
+            let epoch = map.nodes[0].epoch;
+            replace_master(&mut map, master, epoch);
+            promoted = true;
+        } else if force {
+            server.cluster.manual.can_start.store(true, Relaxed);
+        } else {
+            let mut packet = header(server, &map, T_MFSTART);
+            seal(&mut packet);
+            let id = yo_alloc::allow(|| map.nodes[usize::from(master)].id.clone());
+            ask = Some((id, packet));
         }
     }
+    if promoted {
+        won(server);
+    }
+    if let Some((id, packet)) = ask
+        && let Some(link) = server.cluster.bus.outbound(&id)
+    {
+        link.send(&packet);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- the cron
@@ -1961,6 +2236,7 @@ fn cron(server: &Arc<Server>) {
         let mut shout: Vec<Vec<u8>> = Vec::new();
         let mut follow: Option<(String, u16)> = None;
         let mut save = false;
+        let paused = server.cluster.manual.held.load(Relaxed) != 0;
         {
             let mut map = server.cluster.map.lock();
             let count = map.nodes.len();
@@ -1993,7 +2269,16 @@ fn cron(server: &Arc<Server>) {
                 // of getting round a cluster in far fewer than N rounds.
                 let quiet = now.saturating_sub(node.pong_recv);
                 let due = node.ping_sent == 0 && quiet > PING_MS;
-                if due || (tick.is_multiple_of(10) && oldest_of_five(&map, now) == Some(at)) {
+                // A master holding its clients still for a manual failover pings
+                // its replicas on every tick instead of every second, because the
+                // replica cannot move until it has seen a header saying the
+                // writes have stopped and where, and a second of that is a second
+                // of a server nobody can write to.
+                let waiting = paused && node.master == Some(0);
+                if due
+                    || waiting
+                    || (tick.is_multiple_of(10) && oldest_of_five(&map, now) == Some(at))
+                {
                     let packet = ping(server, &map, T_PING, Some(at));
                     let id = yo_alloc::allow(|| map.nodes[usize::from(at)].id.clone());
                     map.nodes[usize::from(at)].ping_sent = now;
@@ -2080,6 +2365,7 @@ fn cron(server: &Arc<Server>) {
             server.cluster.bus.dirty.store(true, Relaxed);
         }
         server.recount_coverage();
+        manual_cron(server, now);
         failover(server, now);
         server.asm_cron();
         server.asm_relax();
@@ -2197,6 +2483,10 @@ impl Server {
 
     /// Become a replica of another node, which is `CLUSTER REPLICATE`.
     pub(super) fn cluster_replicate(self: &Arc<Server>, at: u16) {
+        // A node that has just been told whose replica it is has no business
+        // still holding a manual failover open, and if it armed a pause for one
+        // that pause goes with it.
+        manual_reset(self);
         let (host, port) = {
             let mut map = self.cluster.map.lock();
             // Whatever slots this node was holding are not its any more, which
@@ -2656,6 +2946,194 @@ mod tests {
             server.pretend_following("10.0.0.1", 7001, false);
             server.pretend_master_down_at(T0);
         }));
+    }
+
+    /// The same table the other way round, with this node as the master and
+    /// node 1 as the replica that is about to ask it to stand down.
+    fn standing() -> Arc<Server> {
+        let server = shard();
+        {
+            let mut map = server.cluster.map.lock();
+            map.nodes[0].flags &= !FLAG_SLAVE;
+            map.nodes[0].flags |= FLAG_MASTER;
+            map.nodes[0].master = None;
+            map.nodes[1].flags &= !FLAG_MASTER;
+            map.nodes[1].flags |= FLAG_SLAVE;
+            map.nodes[1].master = Some(0);
+            for slot in 0..=5460 {
+                map.owner[slot] = Some(0);
+            }
+        }
+        server.recount_coverage();
+        server
+    }
+
+    /// The master's half of a manual failover, which is to stop taking writes
+    /// and say where it stopped.
+    #[test]
+    fn a_master_asked_to_stand_down_stops_writing_and_says_where() {
+        let server = standing();
+        let mut todo = Todo::default();
+        {
+            let map = server.cluster.map.lock();
+            stand_down(&server, &map, 2, T0, &mut todo);
+        }
+        assert!(todo.reply.is_empty(), "only a replica of this node may ask");
+        assert_eq!(server.pause_ends(), 0);
+
+        {
+            let map = server.cluster.map.lock();
+            stand_down(&server, &map, 1, T0, &mut todo);
+        }
+        let reply = todo
+            .reply
+            .first()
+            .expect("answered at once, not by the cron");
+        assert_eq!(be16(reply, O_TYPE), T_PING);
+        assert!(
+            reply[O_MFLAGS] & MF_PAUSED != 0,
+            "and the answer says the writes have stopped"
+        );
+        assert_eq!(be64(reply, O_OFFSET), server.repl_offset());
+        // Held for twice as long as the failover has to finish in, so that the
+        // master is still holding them at the moment the replica gives up.
+        assert_eq!(
+            server.pause_ends(),
+            T0 + MANUAL_TIMEOUT_MS * MANUAL_PAUSE_MULT
+        );
+        assert_eq!(
+            server.paused(T0),
+            Some(false),
+            "the writes and not the reads"
+        );
+
+        // And lets go on its own when nothing came of it, which is the one
+        // outcome worth going out of the way to avoid getting wrong.
+        manual_cron(&server, T0 + MANUAL_TIMEOUT_MS + 1);
+        assert_eq!(server.cluster.manual.end.load(Relaxed), 0);
+        assert_eq!(server.pause_ends(), 0);
+    }
+
+    /// The replica's half, which is to wait for the offsets to meet and then go
+    /// straight to the front of the queue.
+    #[test]
+    fn a_manual_failover_waits_for_the_offsets_to_meet() {
+        let server = shard();
+        let step = |now: u64| {
+            let mut map = server.cluster.map.lock();
+            decide(&server, &mut map, now)
+        };
+        let manual = &server.cluster.manual;
+        manual.end.store(T0 + MANUAL_TIMEOUT_MS, Relaxed);
+
+        // The master is up and has not said anything yet, so there is nothing
+        // to stand for.
+        assert!(matches!(step(T0), Step::Idle));
+        manual_cron(&server, T0);
+        assert!(!manual.can_start.load(Relaxed), "no offset from the master");
+        manual.offset.store(server.repl_offset() + 1, Relaxed);
+        manual_cron(&server, T0);
+        assert!(!manual.can_start.load(Relaxed), "still behind the master");
+        assert!(matches!(step(T0), Step::Idle));
+
+        // Caught up with everything the master wrote before it stopped, which
+        // is the moment this is safe and the only one.
+        manual.offset.store(server.repl_offset(), Relaxed);
+        manual_cron(&server, T0);
+        assert!(manual.can_start.load(Relaxed));
+
+        // No fixed delay, no random delay and no rank, because there is nothing
+        // to let propagate and nobody else is standing.
+        assert!(matches!(step(T0), Step::Announce));
+        assert_eq!(server.cluster.vote.at.load(Relaxed), T0);
+        assert_eq!(server.cluster.vote.rank.load(Relaxed), 0);
+        let Step::Ask(packet) = step(T0) else {
+            panic!("nothing to wait for on this path");
+        };
+        assert!(
+            packet[O_MFLAGS] & MF_FORCEACK != 0,
+            "the master is up and is in on it, so say so"
+        );
+
+        server.cluster.vote.count.store(2, Relaxed);
+        assert!(matches!(step(T0), Step::Won));
+        let map = server.cluster.map.lock();
+        assert!(map.nodes[0].is_master());
+        assert_eq!(map.owner[5460], Some(0));
+        assert_eq!(
+            map.owner[5461],
+            Some(2),
+            "and nothing that was not its master's"
+        );
+    }
+
+    /// `CLUSTER FAILOVER` refuses where the reference refuses, and each of its
+    /// three forms does a different amount of asking.
+    #[test]
+    fn cluster_failover_refuses_where_the_reference_refuses() {
+        let ends = |e: Error, want: &str| {
+            let text = e.to_string();
+            assert!(text.ends_with(want), "wanted {want}, got {text}");
+        };
+        let server = standing();
+        ends(
+            manual_failover(&server, false, false).unwrap_err(),
+            "You should send CLUSTER FAILOVER to a replica",
+        );
+        {
+            let mut map = server.cluster.map.lock();
+            map.nodes[0].flags &= !FLAG_MASTER;
+            map.nodes[0].flags |= FLAG_SLAVE;
+            map.nodes[0].master = None;
+        }
+        ends(
+            manual_failover(&server, false, false).unwrap_err(),
+            "I'm a replica but my master is unknown to me",
+        );
+
+        // A master with no link to it cannot be asked to hold its clients
+        // still, so the plain form says which form to use instead.
+        let server = shard();
+        server.cluster.map.lock().nodes[1].linked = false;
+        ends(
+            manual_failover(&server, false, false).unwrap_err(),
+            "Master is down or failed, please use CLUSTER FAILOVER FORCE",
+        );
+        server.cluster.map.lock().nodes[1].linked = true;
+        server.cluster.map.lock().nodes[1].flags |= FLAG_FAIL;
+        ends(
+            manual_failover(&server, false, false).unwrap_err(),
+            "Master is down or failed, please use CLUSTER FAILOVER FORCE",
+        );
+        server.cluster.map.lock().nodes[1].flags &= !FLAG_FAIL;
+        manual_failover(&server, false, false).unwrap();
+        assert_ne!(server.cluster.manual.end.load(Relaxed), 0);
+        assert!(
+            !server.cluster.manual.can_start.load(Relaxed),
+            "the plain form waits for the master to answer"
+        );
+        assert!(server.cluster.map.lock().nodes[0].flags & FLAG_SLAVE != 0);
+
+        // FORCE does not ask the master, but it does still stand for election.
+        let server = shard();
+        manual_failover(&server, true, false).unwrap();
+        assert!(server.cluster.manual.can_start.load(Relaxed));
+        assert!(server.cluster.map.lock().nodes[0].flags & FLAG_SLAVE != 0);
+
+        // TAKEOVER does not ask anybody at all.
+        let server = shard();
+        manual_failover(&server, true, true).unwrap();
+        assert_eq!(
+            server.cluster.manual.end.load(Relaxed),
+            0,
+            "nothing left to wait for"
+        );
+        let map = server.cluster.map.lock();
+        assert!(map.nodes[0].is_master());
+        assert_eq!(map.nodes[0].epoch, 1, "under an epoch it made up");
+        assert_eq!(map.owner[0], Some(0));
+        assert_eq!(map.owner[5460], Some(0));
+        assert_eq!(map.owner[5461], Some(2));
     }
 
     #[test]

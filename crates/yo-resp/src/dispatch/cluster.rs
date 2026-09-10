@@ -42,10 +42,10 @@
 //! it reads the table and edits it, and a change an operator makes here is
 //! announced by asking the bus to send a packet once the lock is gone.
 //!
-//! What is not here is the manual failover, so `CLUSTER FAILOVER` on a replica
-//! is still refused and an operator who wants to move a master on purpose moves
-//! the slots instead. A replica whose master dies promotes itself, which the
-//! bus runs the election for.
+//! Failover is not here either, in both of its forms. A replica whose master
+//! dies promotes itself and an operator can stand a master down by hand with
+//! `CLUSTER FAILOVER`, and the election, the handshake and the pause behind both
+//! of those are in [`bus`] with everything else that talks to another node.
 
 use core::fmt::Write as _;
 use std::sync::atomic::Ordering::Relaxed;
@@ -474,6 +474,8 @@ pub(crate) struct Cluster {
     bus: bus::Bus,
     /// The election this node is standing in or voting in, if any.
     vote: bus::Vote,
+    /// The manual failover this node is in, on whichever side of it.
+    manual: bus::Manual,
     /// The slot migration this node is in, and the ones it has been in.
     asm: asm::Asm,
 }
@@ -497,6 +499,7 @@ impl Default for Cluster {
             file: Lock::new(String::new()),
             bus: bus::Bus::default(),
             vote: bus::Vote::default(),
+            manual: bus::Manual::default(),
             asm: asm::Asm::default(),
         }
     }
@@ -940,16 +943,22 @@ pub(super) fn execute(
             if args.len() > 3 {
                 return Err(sub_syntax(sub));
             }
-            if args.len() == 3
-                && !args::is(args.get(2), b"force")
-                && !args::is(args.get(2), b"takeover")
-            {
+            // TAKEOVER implies FORCE, which is the reference's own line: taking
+            // over without an election is a superset of taking over without
+            // asking the master.
+            let takeover = args.len() == 3 && args::is(args.get(2), b"takeover");
+            let force = takeover || (args.len() == 3 && args::is(args.get(2), b"force"));
+            if args.len() == 3 && !force {
                 return Err(args::syntax());
             }
-            return Err(Error::new(
-                Code::Invalid,
-                "You should send CLUSTER FAILOVER to a replica",
-            ));
+            let Some(shared) = server.myself() else {
+                return Err(Error::new(
+                    Code::Invalid,
+                    "CLUSTER FAILOVER is not available on an embedded server",
+                ));
+            };
+            bus::manual_failover(&shared, force, takeover)?;
+            out.ok();
         }
         () if args::is(sub, b"meet") => {
             if args.len() > 5 {
