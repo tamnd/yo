@@ -1179,6 +1179,18 @@ divergent = "D-26, D-30"
 notes = "The reader is deliberately not the mirror of the writer. We do not choose what arrives, so it accepts every encoding a modern Redis emits, which means the quicklist, the three listpack forms, the intset, both sorted set forms and both hash forms with field deadlines, all four of the stream types, and LZF decompression on top because rdbcompression is on by default and a payload from a real server is full of compressed strings. The four stream types are the same format with pieces added on the end of it, so what varies is which fields are there and never where anything is, and the three fields the oldest one does not carry are worked out from what it does carry rather than left empty, which is what a real server does with the same payload. The check order is the whole of what a client can see and it is not the order the arguments read in: every option is parsed first, then the busy key check, then the time to live, then the footer, then the bytes, so a key that is already there is refused before anybody looks at the payload. IDLETIME and FREQ are exclusive by a trick worth copying exactly, since neither word is rejected for being the wrong one and each is only accepted while the other is unset, so the second of the two falls through to the plain syntax error. A deadline that has already gone deletes and answers OK, and it does that after the payload has been parsed, because a client that sent bad bytes and a stale deadline should be told about the bytes. An empty collection is refused rather than created, which is Redis's emptykey error and the same rule that makes SREM of the last member delete the key."
 
 [[command]]
+name = "RESTORE-ASKING"
+group = "server"
+since = "3.0.0"
+arity = -4
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-26, D-30"
+notes = "RESTORE with an ASKING built into it, and the same body runs for both. It exists because of one problem, which is that the whole point of a slot migration is that the node being sent the keys does not own the slot yet, so a plain RESTORE arriving there comes straight back as a MOVED pointing at the node doing the sending, and the migration never gets off the ground. Redis solves that with a command flag rather than with a name the routing gate knows about, so the flag is what the gate reads here too and the command itself has nothing special in it. MIGRATE switches to this spelling on exactly the condition the reference switches on, which is whether the sending server is a cluster node and nothing else, so a MIGRATE between two servers that are not in a cluster still sends the ordinary word and still works against a server too old to have heard of this one. The group says server rather than keyspace, which is where the reference files it and is what COMMAND DOCS answers, and the client facing consequence of that is nil since the doc flags mark it as a system command that no client should be sending by hand anyway."
+
+[[command]]
 name = "MIGRATE"
 group = "keyspace"
 since = "2.6.0"

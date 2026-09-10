@@ -5815,6 +5815,26 @@ pub static COMMANDS: &[Spec] = &[
         summary: "Create a key from a payload produced by DUMP.",
         group: "keyspace",
     },
+    // The same command with an `ASKING` built into it, which is what `MIGRATE`
+    // sends when the sending server is a cluster node. Without it every key of a
+    // slot migration would come back as a `MOVED` pointing at the node doing the
+    // sending, since the node being sent the keys does not own the slot yet. The
+    // group says server rather than keyspace because that is where the reference
+    // files it, and the body it runs is named for it in `dispatch::run`.
+    Spec {
+        name: "restore-asking",
+        arity: -4,
+        flags: &["write", "denyoom", "asking"],
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        keys: &[OW_UPDATE_AT1],
+        acl: AC_RESTORE,
+        since: "3.0.0",
+        complexity: "O(1) to find the key, then O(N) in the size of the payload.",
+        summary: "An internal command for migrating keys in a cluster.",
+        group: "server",
+    },
     // And the third one, which is the other two with a socket in between. Its
     // keys are movable for the same reason `SORT`'s are, though for a plainer
     // reason: the `KEYS` option moves them from argument three to everything
@@ -7726,7 +7746,7 @@ mod tests {
             "the multiplier stopped keeping every command close"
         );
         assert!(
-            total <= 28,
+            total <= 29,
             "{total} extra slots walked over the whole table"
         );
     }

@@ -20,6 +20,11 @@
 //! `RESTORE` per key that is actually here. The replies come back in that order
 //! and are read in that order, and every one of them is a single line.
 //!
+//! On a cluster node the word is `RESTORE-ASKING` rather than `RESTORE`, which
+//! is the same command with an `ASKING` built into it, because the node being
+//! sent the keys does not own the slot yet and would otherwise answer `MOVED`.
+//! See [`restore_verb`].
+//!
 //! Pipelining the lot has a consequence worth writing down, because it looks
 //! like a bug and it is what a real server does: a `SELECT` that fails does not
 //! stop the `RESTORE`s behind it. They were already on the wire, so the peer
@@ -78,6 +83,22 @@ const CONNECT_FAILED: &[u8] = b"IOERR error or timeout connecting to the client"
 
 /// What a write that failed says.
 const WRITE_FAILED: &[u8] = b"IOERR error or timeout writing to target instance";
+
+/// Which of the two spellings of `RESTORE` goes down the wire.
+///
+/// On a cluster node it is `RESTORE-ASKING`, which is `RESTORE` with an
+/// `ASKING` built into it. The whole point of a slot migration is that the node
+/// receiving the keys does not own the slot yet, so a plain `RESTORE` would come
+/// straight back as a `MOVED` pointing at the node doing the sending. The
+/// reference switches on the same condition and nothing else, so a `MIGRATE` on
+/// a server that is not a cluster node still sends the ordinary word.
+fn restore_verb(clustered: bool) -> &'static [u8] {
+    if clustered {
+        b"RESTORE-ASKING"
+    } else {
+        b"RESTORE"
+    }
+}
 
 /// And a read. The grammar is Redis's, one format string for both halves.
 const READ_FAILED: &[u8] = b"IOERR error or timeout reading to target instance";
@@ -258,6 +279,7 @@ fn run(server: &Server, at: usize, args: Args<'_>, out: &mut Out) -> Result<()> 
         name: &name,
         plan: &plan,
         going: &going,
+        clustered: server.cluster_enabled(),
     };
     let mut retry = true;
     loop {
@@ -297,6 +319,9 @@ struct Sent<'a, 'k> {
     name: &'a str,
     plan: &'a Plan<'k>,
     going: &'a [Going<'k>],
+    /// Whether this server is a cluster node, which decides which of the two
+    /// spellings of `RESTORE` goes down the wire. See [`restore_verb`].
+    clustered: bool,
 }
 
 /// What came back, one line per thing that was sent.
@@ -319,7 +344,12 @@ fn attempt(
     sent: &Sent<'_, '_>,
     now: u64,
 ) -> std::result::Result<Replies, Broke> {
-    let Sent { name, plan, going } = *sent;
+    let Sent {
+        name,
+        plan,
+        going,
+        clustered,
+    } = *sent;
     let held = peers.find(name);
     let last_db = held.map_or(-1, |i| peers.open[i].last_db);
     let select = last_db != plan.db;
@@ -365,7 +395,7 @@ fn attempt(
     }
     for g in going {
         array(&mut cmd, if plan.replace { 5 } else { 4 });
-        bulk(&mut cmd, b"RESTORE");
+        bulk(&mut cmd, restore_verb(clustered));
         bulk(&mut cmd, g.key);
         int(&mut cmd, g.ttl);
         bulk(&mut cmd, &g.payload);
@@ -407,7 +437,9 @@ fn finish(
     replies: &Replies,
     out: &mut Out,
 ) {
-    let Sent { name, plan, going } = *sent;
+    let Sent {
+        name, plan, going, ..
+    } = *sent;
     fn bad(r: &Option<Vec<u8>>) -> Option<&[u8]> {
         r.as_deref().filter(|line| line.first() == Some(&b'-'))
     }

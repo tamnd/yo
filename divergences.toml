@@ -1058,8 +1058,8 @@ spec = "12 section 9"
 
 [[divergence]]
 id = "D-149"
-title = "CLUSTER MIGRATION IMPORT waits on the slot migration"
-reason = "CLUSTER MEET is in and works against a real server, so the half of this that was about the bus is closed. What is left is CLUSTER MIGRATION IMPORT, which is the command that tells a node to take a range of slots off another one and drive the move itself. That needs MIGRATE and the atomic slot handover behind it rather than anything about gossip, so it still checks every argument it was given in full, in the reference's order and with the reference's sentences, and then refuses. A tool that builds a cluster finds out about a bad address or a bad slot range exactly where it would have, and finds out that the move itself is not here yet only once everything it typed was right."
+title = "CLUSTER MIGRATION IMPORT, which is atomic slot migration"
+reason = "The old way of moving a slot is in and works, which is SETSLOT IMPORTING on the node taking it, SETSLOT MIGRATING on the node giving it up, MIGRATE for the keys and SETSLOT NODE on both ends to close it, and that whole path has been driven by hand against a real server in both directions with every node agreeing on the new owner afterwards. What is not in is the new way, which is one command on the importing node that takes a range of slots and drives the entire move itself over the cluster bus, snapshotting the slots and then streaming the writes that land while the snapshot is going out. It checks every argument it was given in full, in the reference's order and with the reference's sentences, and then says it is not implemented yet and names the other path. That last part matters more than it looks, because redis-cli 8.10 picks the new way whenever every node in the cluster reports a version at 8.4.0 or above and there is no flag and no fallback to make it pick the old one, so an operator running the shipped resharding tool against a cluster of these cannot move a slot even though the old path underneath works perfectly."
 status = "until"
 resolved_by = "M8"
 spec = "12 section 9"

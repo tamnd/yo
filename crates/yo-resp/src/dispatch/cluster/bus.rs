@@ -1852,6 +1852,32 @@ impl Server {
         }
     }
 
+    /// Send everybody a `PONG` right now rather than waiting for the cron.
+    ///
+    /// A `PONG` nobody asked for is how the reference tells the cluster about a
+    /// configuration change it has just made to itself, and the only thing that
+    /// makes it a `PONG` rather than a `PING` is that nobody is expected to
+    /// answer it. What the far side actually reads is the header, which carries
+    /// this node's slots and its config epoch, so one packet is the whole of the
+    /// announcement.
+    ///
+    /// It matters after a slot import because the epoch has just gone up and the
+    /// rest of the cluster is still pointing clients at the node the slot came
+    /// from. Waiting the ordinary ping interval would leave every client that
+    /// asked the wrong node being redirected to a node that no longer owns it.
+    pub(super) fn cluster_broadcast_pong(&self) {
+        if !self.cluster_enabled() || !self.cluster.bus.on.load(Relaxed) {
+            return;
+        }
+        let packet = {
+            let map = self.cluster.map.lock();
+            ping(self, &map, T_PONG, None)
+        };
+        for link in self.cluster.bus.all() {
+            link.send(&packet);
+        }
+    }
+
     /// `CLUSTER LINKS`, which is one map per open link in each direction.
     pub(super) fn cluster_links(&self, out: &mut Out) {
         let links = self.cluster.bus.all();

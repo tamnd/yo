@@ -36,12 +36,14 @@
 //! # What is here and what is not
 //!
 //! The slots, the table, the whole `CLUSTER` container, the redirections and the
-//! configuration file that carries all of it across a restart. What is not here
-//! is the cluster bus, which is the binary protocol nodes gossip over, so a node
-//! cannot yet learn about another one on its own and `CLUSTER MEET` says so. A
-//! table with room for other nodes is written as though it were full, because
-//! the bus fills it and changes nothing else, and the redirections are written
-//! and tested against a table that has been filled by hand.
+//! configuration file that carries all of it across a restart. The bus, which is
+//! the binary protocol nodes talk to each other over and the thing that actually
+//! fills the table, is next door in [`bus`]. Nothing in this file dials anybody:
+//! it reads the table and edits it, and a change an operator makes here is
+//! announced by asking the bus to send a packet once the lock is gone.
+//!
+//! What is not here is the failover vote, so a replica of a node that dies is
+//! listed and gossiped correctly and will not promote itself, which is D-152.
 
 use core::fmt::Write as _;
 use std::sync::atomic::Ordering::Relaxed;
@@ -628,6 +630,17 @@ fn new_id() -> [u8; ID_LEN] {
 
 // ------------------------------------------------------------ the redirects
 
+/// Whether the command carries its own `ASKING` rather than needing one sent.
+///
+/// One command does, `RESTORE-ASKING`, and the reference spells that as a flag on
+/// the command rather than as a name the routing gate knows, so this reads the
+/// flag. It is what makes a slot migration work at all: the node being sent the
+/// keys does not own the slot yet, and a client that had to send `ASKING` in
+/// front of every key would double the round trips for no reason.
+pub(super) fn asks(spec: &Spec) -> bool {
+    spec.flags.contains(&"asking")
+}
+
 /// Where a command's keys say it should run, or `None` for run it here.
 ///
 /// Called for every command on a cluster node and for none at all on a server
@@ -861,9 +874,9 @@ pub(super) fn execute(
             add_or_del(server, args, false, true)?;
             out.ok();
         }
-        () if args::is(sub, b"setslot") => setslot(server, args, out)?,
+        () if args::is(sub, b"setslot") => setslot(server, session_db, args, out)?,
         () if args::is(sub, b"flushslots") => flushslots(server, out)?,
-        () if args::is(sub, b"bumpepoch") => bumpepoch(server, out),
+        () if args::is(sub, b"bumpepoch") => bumpepoch(server, out)?,
         () if args::is(sub, b"set-config-epoch") => set_config_epoch(server, args, out)?,
         () if args::is(sub, b"reset") => {
             if args.len() > 3 {
@@ -925,12 +938,15 @@ pub(super) fn disabled() -> Error {
     Error::new(Code::Invalid, "This instance has cluster support disabled")
 }
 
-/// What a subcommand that needs to talk to another node answers until the bus is
-/// in, which is D-149.
-fn no_bus(what: &str) -> Error {
+/// What atomic slot migration answers until it is in, which is D-149.
+///
+/// The sentence names the other way of moving a slot because there is one and it
+/// works, so an operator who reads this is one command away from getting on with
+/// it rather than stuck.
+fn not_yet(what: &str) -> Error {
     Error::fmt(
         Code::Invalid,
-        format_args!("{what} is not available until the cluster bus is in"),
+        format_args!("{what} is not implemented yet, move the slot with SETSLOT and MIGRATE"),
     )
 }
 
@@ -1717,7 +1733,7 @@ fn migration(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         ));
     }
     drop(map);
-    Err(no_bus("CLUSTER MIGRATION IMPORT"))
+    Err(not_yet("CLUSTER MIGRATION IMPORT"))
 }
 
 /// `CLUSTER SETSLOT <slot> IMPORTING|MIGRATING|STABLE|NODE`.
@@ -1725,7 +1741,22 @@ fn migration(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// The four arms and the order of their checks are the reference's, which is
 /// worth being exact about because a resharding tool drives this and reads the
 /// sentences it gets back.
-fn setslot(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
+///
+/// `NODE` is where a slot migration ends and it is the one arm that does more
+/// than move a field. When the node being named is this one and this node was
+/// importing the slot, the config epoch goes up and the whole cluster is told
+/// straight away, because until that happens every other node is still pointing
+/// clients at the node the slot came from and the higher epoch is the only thing
+/// that makes them stop.
+fn setslot(server: &Server, session_db: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
+    // A replica has no say in who owns what, so this is refused before the slot
+    // number is even looked at.
+    if !server.cluster.map.lock().nodes[0].is_master() {
+        return Err(Error::new(
+            Code::Invalid,
+            "Please use SETSLOT only with masters.",
+        ));
+    }
     let slot = slot_arg(&args, 2)?;
     let action = args.get(3);
     let wrong = || {
@@ -1734,6 +1765,13 @@ fn setslot(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
             "Invalid CLUSTER SETSLOT action or number of arguments. Try CLUSTER HELP",
         )
     };
+    // Set when the `NODE` arm decides the rest of the cluster has to be told
+    // now rather than at the next ping. Done once the lock is gone, since
+    // building the packet takes the same lock.
+    let mut announce = false;
+    // And when this node has just given its last slot away and should follow
+    // whoever took it. The same, and for the same reason.
+    let mut follow: Option<u16> = None;
     {
         let mut map = server.cluster.map.lock();
         let at = usize::from(slot);
@@ -1766,17 +1804,104 @@ fn setslot(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
             let Some(to) = map.find(args.get(4)) else {
                 return Err(unknown_node(args.get(4)));
             };
+            if !map.nodes[usize::from(to)].is_master() {
+                return Err(Error::new(Code::Invalid, "Target node is not a master"));
+            }
+            let was_mine = map.owner[at] == Some(0);
+            // The keys are counted twice here rather than once, which reads
+            // oddly and is the reference's own shape. The first count refuses
+            // handing the slot to somebody else while this node is still
+            // holding keys for it, since that would leave two nodes answering
+            // for the same data. The second clears the migrating mark, and it
+            // is a separate question because a slot can be empty and marked
+            // whether or not it was ever this node's.
+            let held = keys_in_slot(server, session_db, slot);
+            if was_mine && to != 0 && held != 0 {
+                return Err(Error::fmt(
+                    Code::Invalid,
+                    format_args!(
+                        "Can't assign hashslot {slot} to a different node while I still hold keys for this hash slot."
+                    ),
+                ));
+            }
+            if held == 0 {
+                map.migrating[at] = None;
+            }
             map.owner[at] = Some(to);
-            map.migrating[at] = None;
-            map.importing[at] = None;
+            // A master that has just handed over its last slot follows whoever
+            // took it, which is what stops a resharded cluster being left with
+            // a node that owns nothing and serves nobody.
+            if was_mine && to != 0 && map.runs(0).is_empty() {
+                follow = Some(to);
+            }
+            // The import is finished, so the epoch goes up and everybody is
+            // told. Nothing else in this function moves the epoch, because
+            // nothing else is this node claiming something that used to be
+            // somebody else's.
+            if to == 0 && map.importing[at].is_some() {
+                bump_without_consensus(server, &mut map);
+                map.importing[at] = None;
+                announce = true;
+            }
         } else {
             return Err(wrong());
         }
     }
     server.recount_coverage();
     save(server)?;
+    // Only on a real server. An embedded one has no bus and nobody to follow,
+    // and the slot still changes hands the same way.
+    if let Some(to) = follow
+        && let Some(shared) = server.myself()
+    {
+        shared.cluster_replicate(to);
+    }
+    if announce {
+        server.cluster_broadcast_pong();
+    }
     out.ok();
     Ok(())
+}
+
+/// How many keys of a slot are here, which two of `SETSLOT NODE`'s refusals turn
+/// on and which `CLUSTER COUNTKEYSINSLOT` answers.
+fn keys_in_slot(server: &Server, at: usize, slot: u16) -> usize {
+    let mut found = 0;
+    server.dbs[at].keys(|key| {
+        if key_slot(key) == slot {
+            found += 1;
+        }
+    });
+    found
+}
+
+/// The reference's `clusterBumpConfigEpochWithoutConsensus`.
+///
+/// A node that has just taken a slot off somebody needs an epoch higher than
+/// theirs, or every other node will keep the old owner: a higher epoch is the
+/// whole of how the cluster decides which of two claims on a slot is the newer
+/// one. Without consensus means exactly that, nobody is asked, and the comment
+/// in the reference is worth repeating: two nodes can end up on the same epoch
+/// this way, and the collision rule sorts that out afterwards rather than the
+/// bump trying to avoid it.
+///
+/// It does nothing at all when this node already holds the largest epoch
+/// anybody has, since there is nothing left to outrank. `false` is that case,
+/// and it is what `CLUSTER BUMPEPOCH` answers `STILL` for.
+fn bump_without_consensus(server: &Server, map: &mut Map) -> bool {
+    let highest = map
+        .nodes
+        .iter()
+        .map(|n| n.epoch)
+        .max()
+        .unwrap_or(0)
+        .max(server.cluster.epoch.load(Relaxed));
+    let mine = map.nodes[0].epoch;
+    if mine != 0 && mine == highest {
+        return false;
+    }
+    map.nodes[0].epoch = server.cluster.epoch.fetch_add(1, Relaxed) + 1;
+    true
 }
 
 /// `CLUSTER FLUSHSLOTS`, which drops every slot this node claims.
@@ -1804,14 +1929,25 @@ fn flushslots(server: &Server, out: &mut Out) -> Result<()> {
 }
 
 /// `CLUSTER BUMPEPOCH`, which takes an epoch above everybody else's.
-fn bumpepoch(server: &Server, out: &mut Out) {
-    let next = server.cluster.epoch.fetch_add(1, Relaxed) + 1;
-    {
+///
+/// Answers `BUMPED` and the new epoch when it moved and `STILL` and the current
+/// one when there was nothing to outrank, which is what a second call in a row
+/// gets. See [`bump_without_consensus`] for why doing nothing is the right
+/// answer rather than a wasted epoch.
+fn bumpepoch(server: &Server, out: &mut Out) -> Result<()> {
+    let (moved, epoch) = {
         let mut map = server.cluster.map.lock();
-        map.nodes[0].epoch = next;
+        let moved = bump_without_consensus(server, &mut map);
+        (moved, map.nodes[0].epoch)
+    };
+    if moved {
+        save(server)?;
+        server.cluster_broadcast_pong();
     }
-    let text = yo_alloc::allow(|| format!("BUMPED {next}"));
+    let word = if moved { "BUMPED" } else { "STILL" };
+    let text = yo_alloc::allow(|| format!("{word} {epoch}"));
     out.simple(text.as_bytes());
+    Ok(())
 }
 
 /// `CLUSTER SET-CONFIG-EPOCH`, which is how a brand new cluster gives each node
