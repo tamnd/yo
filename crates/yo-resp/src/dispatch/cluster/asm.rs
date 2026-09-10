@@ -18,14 +18,24 @@
 //! # What is here
 //!
 //! The task, which is the record of one of those moves and the thing
-//! `CLUSTER MIGRATION STATUS` reports, and the snapshot, which is the first of
-//! the two streams. A task is created by `CLUSTER SYNCSLOTS SYNC` arriving from
-//! the far side, moves to `wait-rdbchannel`, and gets its snapshot written when
-//! the second connection arrives with `CLUSTER SYNCSLOTS RDBCHANNEL`.
+//! `CLUSTER MIGRATION STATUS` reports, and both streams. A task is created by
+//! `CLUSTER SYNCSLOTS SYNC` arriving from the far side, moves to
+//! `wait-rdbchannel`, gets its snapshot written when the second connection
+//! arrives with `CLUSTER SYNCSLOTS RDBCHANNEL`, and then every write that lands
+//! in the moving slots goes down the first connection behind it until the far
+//! side says it has caught up.
 //!
-//! What is not here is the second stream, the pause and the handoff, so a
-//! migration started against this node gets its snapshot and then waits for
-//! changes that never come. That is D-149 and it is the next piece.
+//! What is not here is the pause and the handoff, so a migration started against
+//! this node reaches `handoff-prep` and stops there rather than giving the slots
+//! up. That is D-149 and it is the next piece.
+//!
+//! # Where the two streams meet
+//!
+//! Exactly at the freeze the snapshot is read under. The stream is switched on
+//! inside it, so there is no instant at which a write is in neither: anything
+//! that got in before the freeze is in the snapshot, and anything after it is in
+//! the stream. Getting that wrong in either direction is a key the far side
+//! never hears about or an `INCR` it runs twice.
 //!
 //! # The snapshot is not an RDB file
 //!
@@ -42,15 +52,23 @@
 //! reason: without a fork, the only way to read one moment of the dataset is to
 //! stop writes while reading it, and the shorter that is the better.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::Relaxed;
+
 use yo_common::lock::Lock;
 use yo_common::{Code, Error, Result};
 use yo_kv::value::{Kind, Str};
 use yo_kv::{Ask, rdb};
 
-use crate::proto::Proto;
+use crate::proto::{Limits, Proto};
 use crate::reply::Out;
+use crate::request::{Argv, Step};
 
-use super::super::Server;
+use super::super::args::Args;
+use super::super::clients::Client;
+use super::super::pubsub::Envelope;
+use super::super::{Server, keyspec, table};
 use super::{ID_LEN, key_slot};
 
 /// How many finished tasks are kept to be asked about afterwards.
@@ -60,6 +78,18 @@ use super::{ID_LEN, key_slot};
 /// thing that reads one is an operator asking what happened, so the number only
 /// has to be larger than the number of moves anybody looks back over.
 const MAX_ARCHIVED: usize = 32;
+
+/// How far behind the far side may be and still be called caught up.
+///
+/// The reference's `cluster-slot-migration-handoff-max-lag-bytes`, which
+/// defaults to this. Waiting for nought would mean waiting for a moment that a
+/// busy server never has, so the rule is instead that the far side is close
+/// enough that it can finish inside the pause rather than before it. A megabyte
+/// of commands is a few milliseconds of applying them.
+///
+/// A constant rather than a config row, because the whole group of migration
+/// settings belongs in the table in one go, which is part of D-149.
+const MAX_LAG: u64 = 1024 * 1024;
 
 /// Where a task has got to.
 ///
@@ -84,6 +114,16 @@ pub(super) enum State {
     WaitBgsaveStart,
     /// The snapshot has gone out and the changes since are going out behind it.
     SendStream,
+    /// The far side is within a hair of caught up, so the next thing to happen
+    /// is writes stopping and the slots changing hands.
+    HandoffPrep,
+    /// What the far side calls itself while it is working through the changes
+    /// that piled up behind the snapshot. Only ever set as the other end's
+    /// state, never as this node's own.
+    StreamingBuf,
+    /// And what it calls itself once that pile is empty and it is waiting to be
+    /// told there is no more coming.
+    WaitStreamEof,
 }
 
 impl State {
@@ -96,7 +136,29 @@ impl State {
             State::WaitRdbChannel => "wait-rdbchannel",
             State::WaitBgsaveStart => "wait-bgsave-start",
             State::SendStream => "send-stream",
+            State::HandoffPrep => "handoff-prep",
+            State::StreamingBuf => "streaming-buffer",
+            State::WaitStreamEof => "wait-stream-eof",
         }
+    }
+
+    /// The state the far side named itself as, if it is one it is allowed to.
+    ///
+    /// Only the two words a destination sends in an `ACK` are taken. Anything
+    /// else is not a state it could be in when it acknowledges, and the
+    /// reference answers nothing at all rather than complaining, because there
+    /// is nobody on that connection reading for a reply.
+    fn dest_word(word: &[u8]) -> Option<State> {
+        match word {
+            _ if word.eq_ignore_ascii_case(b"streaming-buffer") => Some(State::StreamingBuf),
+            _ if word.eq_ignore_ascii_case(b"wait-stream-eof") => Some(State::WaitStreamEof),
+            _ => None,
+        }
+    }
+
+    /// Whether a migration in this state is still sending changes.
+    fn streaming(self) -> bool {
+        matches!(self, State::SendStream | State::HandoffPrep)
     }
 }
 
@@ -127,11 +189,26 @@ pub(super) struct Task {
     started: i64,
     /// When it ended, or minus one for a task that has not.
     ended: i64,
-    /// The connection the far side asked over, which is the one the changes
-    /// would go down. `None` for a task nobody is holding open.
-    main: Option<u64>,
+    /// The connection the far side asked over, which is the one the changes go
+    /// down. `None` for a task nobody is holding open.
+    ///
+    /// The whole row rather than the id, because the changes are handed to the
+    /// thread that owns the connection and it takes both the slot number and the
+    /// id to be sure of writing to the connection that is still there rather
+    /// than to whatever took its place.
+    main: Option<Arc<Client>>,
     /// The connection the snapshot goes down.
     rdb: Option<u64>,
+    /// Bytes of changes handed to the main channel since the snapshot.
+    ///
+    /// A count of this stream and not a replication offset. The far side counts
+    /// the same bytes as it works through them and says how far it has got, and
+    /// the two meeting is what says it is safe to stop taking writes.
+    sent: u64,
+    /// The last count the far side acknowledged. Never allowed to go backwards.
+    acked: u64,
+    /// What the far side said it was doing when it last acknowledged.
+    dest_state: State,
 }
 
 impl Task {
@@ -207,6 +284,13 @@ impl Task {
 #[derive(Default)]
 pub(super) struct Asm {
     inner: Lock<Tasks>,
+    /// Whether there is a migration sending changes right now.
+    ///
+    /// Outside the lock because it is read once for every write the server
+    /// takes, and on a server that is not moving a slot, which is nearly all of
+    /// them nearly all of the time, the answer is no and the lock would be a
+    /// contended one on the hot path for nothing.
+    streaming: AtomicBool,
 }
 
 /// The live task and the ones that have finished, newest first.
@@ -271,8 +355,46 @@ impl Asm {
         }
         task.state = State::Canceled;
         task.blame("Cancelled due to user request");
-        tasks.finish(now);
+        self.retire(&mut tasks, now);
         1
+    }
+
+    /// Move the live task onto the finished list and shut the stream gate.
+    ///
+    /// Every way a task ends goes through here, which is what makes the gate
+    /// and the task agree: a task that is no longer live cannot be one that is
+    /// still being fed.
+    fn retire(&self, tasks: &mut Tasks, now: i64) {
+        tasks.finish(now);
+        self.streaming.store(false, Relaxed);
+    }
+
+    /// Start sending changes, which the snapshot does from inside its freeze.
+    fn start_stream(&self) {
+        let mut tasks = self.inner.lock();
+        if let Some(task) = tasks.live.as_mut()
+            && task.state == State::WaitBgsaveStart
+        {
+            task.state = State::SendStream;
+            self.streaming.store(true, Relaxed);
+        }
+    }
+
+    /// Give up on the live task because a command touched two slots at once.
+    ///
+    /// The stream is one slot range and a command across two of them cannot be
+    /// split, so there is nothing to send that would leave the far side with the
+    /// right answer. In cluster mode the routing gate refuses one of these
+    /// before it runs, so what is left is a script or a module reaching past
+    /// what it declared, and the migration is the thing that gives way.
+    fn cross_slot(&self, now: i64) {
+        let mut tasks = self.inner.lock();
+        let Some(task) = tasks.live.as_mut() else {
+            return;
+        };
+        task.state = State::Canceled;
+        task.blame("Cancelled due to propagating cross slot command");
+        self.retire(&mut tasks, now);
     }
 
     /// Give up on the live task if one of its connections has gone.
@@ -285,19 +407,47 @@ impl Asm {
         let Some(task) = tasks.live.as_mut() else {
             return;
         };
-        if task.main != Some(conn) && task.rdb != Some(conn) {
+        let main = task.main.as_ref().is_some_and(|row| row.id == conn);
+        if !main && task.rdb != Some(conn) {
             return;
         }
-        let which = if task.main == Some(conn) {
-            "Main"
-        } else {
-            "RDB"
-        };
+        let which = if main { "Main" } else { "RDB" };
         task.state = State::Failed;
         task.blame(&yo_alloc::allow(|| {
             format!("{which} channel - Connection with the peer node was lost")
         }));
-        tasks.finish(now);
+        self.retire(&mut tasks, now);
+    }
+
+    /// Take the far side's `CLUSTER SYNCSLOTS ACK <state> <offset>`.
+    ///
+    /// Nothing is written back. The acknowledgement is a number travelling one
+    /// way on a connection whose other direction is the change stream, and a
+    /// reply on it would be read as a command.
+    ///
+    /// Once the far side is within [`MAX_LAG`] of everything that has been sent,
+    /// the task moves to `handoff-prep`, which is the point at which writes
+    /// would stop. Stopping them is D-149, so for now it says so and waits.
+    fn ack(&self, conn: u64, state: State, offset: u64) {
+        let mut tasks = self.inner.lock();
+        let Some(task) = tasks.live.as_mut() else {
+            return;
+        };
+        if task.import || !task.main.as_ref().is_some_and(|row| row.id == conn) {
+            return;
+        }
+        task.dest_state = state;
+        // Backwards is not an error and not a state to act on. The reference
+        // logs it and carries on, because the far side reconnecting and starting
+        // its count again is a thing that happens and the older number is simply
+        // stale.
+        if offset < task.acked {
+            return;
+        }
+        task.acked = offset;
+        if task.state == State::SendStream && task.acked + MAX_LAG >= task.sent {
+            task.state = State::HandoffPrep;
+        }
     }
 }
 
@@ -323,7 +473,7 @@ impl Server {
         id: &[u8],
         dest: &[u8],
         slots: Vec<(u16, u16)>,
-        conn: u64,
+        row: &Arc<Client>,
     ) -> Result<()> {
         let now = self.now_ms() as i64;
         let source = self.cluster.map.lock().nodes[0].id.clone();
@@ -360,7 +510,7 @@ impl Server {
                 .expect("there is one, or replace is not set");
             live.state = State::Canceled;
             live.blame("Cancelled due to new migration requested");
-            tasks.finish(now);
+            self.cluster.asm.retire(&mut tasks, now);
         }
         tasks.live = Some(Task {
             id: yo_alloc::allow(|| String::from_utf8_lossy(id).into_owned()),
@@ -374,8 +524,11 @@ impl Server {
             created: now,
             started: now,
             ended: -1,
-            main: Some(conn),
+            main: Some(Arc::clone(row)),
             rdb: None,
+            sent: 0,
+            acked: 0,
+            dest_state: State::None,
         });
         Ok(())
     }
@@ -413,31 +566,121 @@ impl Server {
         Ok(task.slots.clone())
     }
 
-    /// Say the snapshot has gone out, which is the reference's
-    /// `asmSlotSnapshotSucceed`.
-    pub(super) fn asm_snapshot_sent(&self) {
-        let mut tasks = self.cluster.asm.inner.lock();
-        if let Some(task) = tasks.live.as_mut()
-            && task.state == State::WaitBgsaveStart
-        {
-            task.state = State::SendStream;
-        }
-    }
-
     /// The snapshot of `slots`, as the stream of commands the far side runs.
     ///
     /// Built at one instant of the dataset, so what comes back is what the slots
-    /// held at one point in the replication stream and not a smear across
-    /// several. The offset that point sits at comes back with it, because the
-    /// changes that follow have to start from exactly there or the far side ends
-    /// up with a key applied twice or not at all.
-    pub(super) fn asm_snapshot(&self, slots: &[(u16, u16)]) -> (Vec<u8>, u64) {
-        let (image, offset) = self.at_an_instant(|| {
+    /// held at one point and not a smear across several. The change stream is
+    /// switched on inside that same instant, which is the only place it can be
+    /// switched on and have the two meet exactly: a write that landed in the gap
+    /// would be in the snapshot and in the stream, or in neither.
+    pub(super) fn asm_snapshot(&self, slots: &[(u16, u16)]) -> Vec<u8> {
+        let (image, _at) = self.at_an_instant(|| {
             let mut out = Out::with_capacity(Proto::Resp2, 4096);
             self.write_snapshot(slots, &mut out);
+            self.cluster.asm.start_stream();
             out.into_inner()
         });
-        (image, offset)
+        image
+    }
+
+    /// Whether anything at all is listening to what this server writes.
+    ///
+    /// A replica is the usual reason and a migration in flight is the other one,
+    /// and the second is why this is not simply [`Server::replicated`]: a node
+    /// with no replicas still has to send the changes to the slots it is handing
+    /// over, or the far side takes them holding what they looked like a moment
+    /// ago.
+    pub(crate) fn propagating(&self) -> bool {
+        self.replicated() || self.cluster.asm.streaming.load(Relaxed)
+    }
+
+    /// Hand one propagated command to a migration, if it belongs to one.
+    ///
+    /// `wire` is the command already rendered, which is the same bytes the
+    /// replication stream carries and the same bytes the far side will be sent,
+    /// so nothing is built twice.
+    ///
+    /// Reading the keys back out of it means decoding it again, which is a pass
+    /// over bytes that were just written. That is worth saying out loud: it is
+    /// the price of hooking in at the one place everything propagated comes
+    /// through, rewrites and expiries and script effects and all, rather than at
+    /// each of the hundred places that reach it. It costs nothing at all unless
+    /// a migration is running, which is the case this is arranged around.
+    pub(crate) fn asm_feed(&self, wire: &[u8]) {
+        if !self.cluster.asm.streaming.load(Relaxed) {
+            return;
+        }
+        let mut argv = Argv::new();
+        let read = yo_alloc::allow(|| argv.decode(wire, &Limits::DEFAULT));
+        if !matches!(read, Ok(Step::Command { .. })) {
+            return;
+        }
+        let args = Args::new(&argv, wire);
+        let Some(spec) = table::lookup(args.name()) else {
+            return;
+        };
+        // A command that names no key is not sent at all. That covers `SELECT`,
+        // which has nothing to say to a cluster with one database, `MULTI` and
+        // `EXEC`, which have nothing to group before the handoff, and `PING`.
+        if !keyspec::takes_keys(spec, args, 0) {
+            return;
+        }
+        let mut slot: Option<u16> = None;
+        let mut crossed = false;
+        keyspec::find(spec, args, 0, &mut |run| {
+            for i in 0..run.count {
+                let at = run.first + i * run.step;
+                if at >= args.len() {
+                    continue;
+                }
+                let this = key_slot(args.get(at));
+                match slot {
+                    None => slot = Some(this),
+                    Some(first) if first != this => crossed = true,
+                    Some(_) => {}
+                }
+            }
+        });
+        if crossed {
+            self.cluster.asm.cross_slot(self.now_ms() as i64);
+            return;
+        }
+        let Some(slot) = slot else {
+            return;
+        };
+        let target = {
+            let mut tasks = self.cluster.asm.inner.lock();
+            let Some(task) = tasks.live.as_mut() else {
+                return;
+            };
+            if task.import || !task.state.streaming() {
+                return;
+            }
+            if !task
+                .slots
+                .iter()
+                .any(|(from, to)| (*from..=*to).contains(&slot))
+            {
+                return;
+            }
+            task.sent += wire.len() as u64;
+            task.main.clone()
+        };
+        let Some(row) = target else {
+            return;
+        };
+        let shared = yo_alloc::allow(|| Arc::new(wire.to_vec()));
+        self.post(
+            row.thread.load(Relaxed),
+            Envelope::raw(row.conn.load(Relaxed), row.id, shared),
+        );
+    }
+
+    /// Take an acknowledgement from the node the slots are going to.
+    pub(super) fn asm_ack(&self, conn: u64, state: &[u8], offset: u64) {
+        if let Some(state) = State::dest_word(state) {
+            self.cluster.asm.ack(conn, state, offset);
+        }
     }
 
     /// The body of [`Server::asm_snapshot`], with nothing writing behind it.
@@ -567,8 +810,11 @@ mod tests {
     use yo_kv::End;
     use yo_kv::strings::{Expire, SetOptions};
 
+    use std::sync::Arc;
+
     use super::super::super::Server;
-    use super::{State, key_slot};
+    use super::super::super::clients::Client;
+    use super::{MAX_LAG, State, key_slot};
     use crate::proto::Proto;
     use crate::reply::Out;
 
@@ -601,6 +847,14 @@ mod tests {
 
     /// The snapshot of every slot, which is what a whole node moving would ask
     /// for and what makes the shape easiest to read.
+    /// A connection row standing in for one of the two the far side opens.
+    ///
+    /// Nothing here writes to it, so what matters is only its id, which is what
+    /// a task holds a channel by.
+    fn wire(id: u64) -> Arc<Client> {
+        Arc::new(Client::new(id))
+    }
+
     fn snapshot(server: &Server) -> String {
         let mut out = Out::with_capacity(Proto::Resp2, 1024);
         server.write_snapshot(&[(0, 16383)], &mut out);
@@ -713,7 +967,7 @@ mod tests {
         let id = [b'b'; 40];
         let dest = [b'c'; 40];
         server
-            .asm_begin_migrate(&id, &dest, vec![(0, 100)], 7)
+            .asm_begin_migrate(&id, &dest, vec![(0, 100)], &wire(7))
             .expect("nothing else is running");
         let mut out = Out::new(Proto::Resp3);
         server.cluster.asm.report_all(&mut out);
@@ -726,10 +980,106 @@ mod tests {
             .asm_take_rdb_channel(&id, 8)
             .expect("the task is waiting for it");
         assert_eq!(slots, vec![(0, 100)]);
-        server.asm_snapshot_sent();
+        let image = server.asm_snapshot(&slots);
+        assert!(image.ends_with(b"$12\r\nSNAPSHOT-EOF\r\n"));
         let mut out = Out::new(Proto::Resp3);
         server.cluster.asm.report_one(&id, &mut out);
         assert!(text(&out).contains("send-stream"), "{:?}", text(&out));
+        // And taking the snapshot is what opens the change stream, because the
+        // two have to meet at the same instant.
+        assert!(server.propagating());
+    }
+
+    /// A write to a slot that is moving is counted against the stream, and one
+    /// to a slot that is not is left alone.
+    #[test]
+    fn only_the_slots_that_are_moving_are_streamed() {
+        let server = node();
+        let foo = key_slot(b"foo");
+        let bar = key_slot(b"bar");
+        assert_ne!(foo, bar);
+        server
+            .asm_begin_migrate(&[b'b'; 40], &[b'c'; 40], vec![(foo, foo)], &wire(7))
+            .expect("nothing else is running");
+        server
+            .asm_take_rdb_channel(&[b'b'; 40], 8)
+            .expect("the task is waiting for it");
+        server.asm_snapshot(&[(foo, foo)]);
+
+        let sent = |server: &Server| server.cluster.asm.inner.lock().live.as_ref().unwrap().sent;
+        assert_eq!(sent(&server), 0);
+        server.asm_feed(b"*3\r\n$3\r\nSET\r\n$3\r\nbar\r\n$1\r\nx\r\n");
+        assert_eq!(sent(&server), 0, "another slot is not this migration");
+        server.asm_feed(b"*1\r\n$4\r\nPING\r\n");
+        assert_eq!(sent(&server), 0, "a command with no key is not sent");
+        let write = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$1\r\nx\r\n";
+        server.asm_feed(write);
+        assert_eq!(sent(&server), write.len() as u64);
+    }
+
+    /// A command that reaches into two slots at once cannot be sent, because
+    /// there is no half of it that leaves the far side right.
+    #[test]
+    fn a_cross_slot_command_ends_the_migration() {
+        let server = node();
+        let foo = key_slot(b"foo");
+        server
+            .asm_begin_migrate(&[b'b'; 40], &[b'c'; 40], vec![(foo, foo)], &wire(7))
+            .expect("nothing else is running");
+        server
+            .asm_take_rdb_channel(&[b'b'; 40], 8)
+            .expect("the task is waiting for it");
+        server.asm_snapshot(&[(foo, foo)]);
+        server.asm_feed(b"*3\r\n$3\r\nDEL\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
+        assert!(!server.propagating());
+        let mut out = Out::new(Proto::Resp3);
+        server.cluster.asm.report_one(&[b'b'; 40], &mut out);
+        let got = text(&out);
+        assert!(got.contains("canceled"), "{got:?}");
+        assert!(got.contains("propagating cross slot command"), "{got:?}");
+    }
+
+    /// The far side saying how far it has got is what moves the task on to the
+    /// point where writes would stop.
+    #[test]
+    fn catching_up_moves_the_task_to_handoff_prep() {
+        let server = node();
+        let id = [b'b'; 40];
+        server
+            .asm_begin_migrate(&id, &[b'c'; 40], vec![(0, 16383)], &wire(7))
+            .expect("nothing else is running");
+        server
+            .asm_take_rdb_channel(&id, 8)
+            .expect("the task is waiting for it");
+        server.asm_snapshot(&[(0, 16383)]);
+        {
+            let mut tasks = server.cluster.asm.inner.lock();
+            tasks.live.as_mut().unwrap().sent = MAX_LAG * 4;
+        }
+        // A word that is not one the far side is allowed to send changes
+        // nothing, and neither does an acknowledgement on another connection.
+        server.asm_ack(7, b"takeover", MAX_LAG * 4);
+        server.asm_ack(9, b"streaming-buffer", MAX_LAG * 4);
+        // Still a long way behind.
+        server.asm_ack(7, b"streaming-buffer", MAX_LAG);
+        let state = |server: &Server| server.cluster.asm.inner.lock().live.as_ref().unwrap().state;
+        assert_eq!(state(&server), State::SendStream);
+        // Going backwards is stale rather than wrong, and is dropped.
+        server.asm_ack(7, b"streaming-buffer", 0);
+        assert_eq!(
+            server.cluster.asm.inner.lock().live.as_ref().unwrap().acked,
+            MAX_LAG
+        );
+        // And within a megabyte is close enough.
+        server.asm_ack(7, b"wait-stream-eof", MAX_LAG * 3);
+        assert_eq!(state(&server), State::HandoffPrep);
+        // Which is still a state that takes the changes still arriving.
+        let write = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$1\r\nx\r\n";
+        server.asm_feed(write);
+        assert_eq!(
+            server.cluster.asm.inner.lock().live.as_ref().unwrap().sent,
+            MAX_LAG * 4 + write.len() as u64
+        );
     }
 
     /// One at a time, because two moves at once would each be pausing writes
@@ -738,10 +1088,10 @@ mod tests {
     fn a_second_migration_is_refused_while_one_is_running() {
         let server = node();
         server
-            .asm_begin_migrate(&[b'b'; 40], &[b'c'; 40], vec![(0, 100)], 7)
+            .asm_begin_migrate(&[b'b'; 40], &[b'c'; 40], vec![(0, 100)], &wire(7))
             .expect("nothing else is running");
         let err = server
-            .asm_begin_migrate(&[b'd'; 40], &[b'c'; 40], vec![(200, 300)], 9)
+            .asm_begin_migrate(&[b'd'; 40], &[b'c'; 40], vec![(200, 300)], &wire(9))
             .expect_err("one is running");
         assert!(
             err.to_string()
@@ -758,7 +1108,7 @@ mod tests {
         let id = [b'b'; 40];
         let dest = [b'c'; 40];
         server
-            .asm_begin_migrate(&id, &dest, vec![(0, 100)], 7)
+            .asm_begin_migrate(&id, &dest, vec![(0, 100)], &wire(7))
             .expect("nothing else is running");
         // The connection the far side asked over goes away, which is the end of
         // that attempt.
@@ -776,7 +1126,7 @@ mod tests {
         // A failed task is not live, so the retry is simply the next task, and
         // what matters is that it is taken at all.
         server
-            .asm_begin_migrate(&id, &dest, vec![(0, 100)], 11)
+            .asm_begin_migrate(&id, &dest, vec![(0, 100)], &wire(11))
             .expect("the failed one does not block it");
     }
 
@@ -787,7 +1137,7 @@ mod tests {
         let server = node();
         let id = [b'b'; 40];
         server
-            .asm_begin_migrate(&id, &[b'c'; 40], vec![(0, 100)], 7)
+            .asm_begin_migrate(&id, &[b'c'; 40], vec![(0, 100)], &wire(7))
             .expect("nothing else is running");
         assert_eq!(server.cluster.asm.cancel(Some(&[b'z'; 40]), 1), 0);
         assert_eq!(server.cluster.asm.cancel(None, 2), 1);
@@ -812,7 +1162,7 @@ mod tests {
                 .contains("No slot migration task in progress")
         );
         server
-            .asm_begin_migrate(&[b'b'; 40], &[b'c'; 40], vec![(0, 100)], 7)
+            .asm_begin_migrate(&[b'b'; 40], &[b'c'; 40], vec![(0, 100)], &wire(7))
             .expect("nothing else is running");
         let err = server
             .asm_take_rdb_channel(&[b'd'; 40], 8)
@@ -843,7 +1193,7 @@ mod tests {
         for i in 0..(super::MAX_ARCHIVED + 5) {
             let id = format!("{i:040}");
             server
-                .asm_begin_migrate(id.as_bytes(), &[b'c'; 40], vec![(0, 100)], 7)
+                .asm_begin_migrate(id.as_bytes(), &[b'c'; 40], vec![(0, 100)], &wire(7))
                 .expect("the last one was cancelled");
             assert_eq!(server.cluster.asm.cancel(None, 1), 1);
         }

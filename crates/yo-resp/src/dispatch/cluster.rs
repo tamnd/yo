@@ -1859,11 +1859,20 @@ fn syncslots(server: &Server, session: &mut Session, args: Args<'_>, out: &mut O
         session.hang_up();
         return Ok(());
     }
-    if (args::is(action, b"ack") && args.len() == 5)
-        || (args::is(action, b"fail") && args.len() == 4)
-    {
-        // The two arms that never answer. `ACK` moves a number on the task it
-        // belongs to and there is no task, and `FAIL` does nothing at all on the
+    if args::is(action, b"ack") && args.len() == 5 {
+        // The arm that answers nothing. This connection's other direction is the
+        // change stream, and anything written back on it would be read as a
+        // command, so a bad state word or a number that is not one is dropped in
+        // silence rather than refused.
+        if let Some(offset) = yo_common::num::parse_i64(args.get(4))
+            && offset >= 0
+        {
+            server.asm_ack(session.row().id, args.get(3), offset as u64);
+        }
+        return Ok(());
+    }
+    if args::is(action, b"fail") && args.len() == 4 {
+        // The other arm that never answers. `FAIL` does nothing at all on the
         // reference either: it is there so that the far side has something to
         // send that will not come back as a syntax error.
         return Ok(());
@@ -1940,7 +1949,7 @@ fn sync(server: &Server, session: &mut Session, args: Args<'_>, out: &mut Out) -
             ));
         }
     }
-    server.asm_begin_migrate(args.get(3), session.node_id(), ranges, session.row().id)?;
+    server.asm_begin_migrate(args.get(3), session.node_id(), ranges, session.row())?;
     out.simple(b"RDBCHANNELSYNCSLOTS");
     Ok(())
 }
@@ -1960,9 +1969,7 @@ fn rdbchannel(server: &Server, session: &mut Session, args: Args<'_>, out: &mut 
     }
     let ranges = server.asm_take_rdb_channel(id, session.row().id)?;
     out.simple(b"SLOTSSNAPSHOT");
-    let (image, _offset) = server.asm_snapshot(&ranges);
-    out.raw(&image);
-    server.asm_snapshot_sent();
+    out.raw(&server.asm_snapshot(&ranges));
     Ok(())
 }
 

@@ -318,7 +318,7 @@ pub(super) fn arm(server: &Server, db: usize) -> Armed {
     // reason: a key that goes on its own has to be sent on as a deletion, since
     // a replica never takes one away by itself. So the hook goes in for either,
     // and `heard` sorts out which of the two is asking.
-    let copying = repl::arm(server.replicated());
+    let copying = repl::arm(server.propagating());
     // Installed for a command that has somewhere to send what it hears and not
     // for one that does not, which is the storage layer's only way of knowing
     // whether the questions it would have to ask to say anything are worth

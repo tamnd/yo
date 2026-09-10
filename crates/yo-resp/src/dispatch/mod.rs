@@ -3360,14 +3360,15 @@ pub fn resolved(
     // below are handed a database and their arguments and have no way to reach
     // the pub/sub registry from there. Off costs one thread local store.
     let armed = notify::arm(server, session.db);
-    // And whether what it does has to reach a replica as well, which the bodies
-    // ask about for the same reason and get an answer by the same route. That
+    // And whether what it does has to reach a replica, or the node a slot range
+    // is being handed to, which the bodies ask about for the same reason and get
+    // an answer by the same route. That
     // arming is done by `notify::arm` above, since the two listeners hear about
     // an expired key through the same hook and only one of them can install it.
     // What is left here is whether the command as the client sent it would be a
     // fair thing to hand a replica, which is the write flag and nothing else: a
     // read sends only what its body pushed, which is normally nothing.
-    let copying = server.replicated();
+    let copying = server.propagating();
     let verbatim = spec.flags.contains(&"write");
     // Which of the keys this command reads are not there. A real server says
     // this from inside each lookup and this says all of them in front, which is
@@ -32315,9 +32316,16 @@ mod tests {
         let words = only(&f.crossed(&[b"SPOP", b"s"]));
         assert_eq!(&words[..2], ["SREM", "s"], "{words:?}");
         assert!(words[2] == "one" || words[2] == "two", "{words:?}");
-        // The one that took the last member crosses as the key going, since
-        // that is what happened and a set with nothing in it does not exist.
-        assert_eq!(only(&f.crossed(&[b"SPOP", b"s"])), ["DEL", "s"]);
+        // The one that took the last member still crosses as the removal and
+        // not as the key going, which is a real server's rule and not an
+        // oversight: the far side takes the member out and finds it is holding
+        // an empty set, which it drops on its own.
+        let words = only(&f.crossed(&[b"SPOP", b"s"]));
+        assert_eq!(&words[..2], ["SREM", "s"], "{words:?}");
+        // The form with a count is where taking the lot is sent as the delete,
+        // because there it can be one line instead of a whole set of them.
+        f.crossed(&[b"SADD", b"s", b"one", b"two"]);
+        assert_eq!(only(&f.crossed(&[b"SPOP", b"s", b"2"])), ["DEL", "s"]);
         f.crossed(&[b"SET", b"n", b"1"]);
         assert_eq!(
             only(&f.crossed(&[b"INCRBYFLOAT", b"n", b"1.5"])),

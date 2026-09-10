@@ -138,7 +138,7 @@ pub(super) fn execute(
                     out.nil();
                 }
                 debug_assert!(out.len() > start, "a reply went out either way");
-                popped(db, key, &drawn);
+                popped(db, key, &drawn, false);
                 if got {
                     notify::fire(on, class::SET, "spop", key);
                     notify::emptied(db, on, key);
@@ -157,7 +157,7 @@ pub(super) fn execute(
                     n += 1;
                 })?;
                 out.close_set(start, n);
-                popped(db, key, &drawn);
+                popped(db, key, &drawn, true);
                 // A set that is there is never empty, so nothing drawn means
                 // either a missing key or a count of zero, and neither of those
                 // says anything. A count that took the whole set says `spop`
@@ -427,7 +427,14 @@ fn member_bytes(m: Member<'_>) -> Vec<u8> {
 /// is the members that were actually taken, or the delete when they were all of
 /// them, which is what a real master sends and is a good deal shorter than
 /// naming a whole set one member at a time.
-fn popped(db: &Db, key: &[u8], drawn: &[Vec<u8>]) {
+///
+/// `counted` is whether the client asked for a number of members rather than
+/// one, because the shortcut is only taken for that form. `SPOP key` on a set of
+/// one sends the `SREM` for the member it took and lets the far side notice the
+/// set is empty, which is what a real server does and is worth copying exactly:
+/// the two are the same on a replica and are not the same in a stream somebody
+/// is reading, which an audit trail out of the keyspace notifications is.
+fn popped(db: &Db, key: &[u8], drawn: &[Vec<u8>], counted: bool) {
     if !repl::armed() {
         return;
     }
@@ -435,7 +442,7 @@ fn popped(db: &Db, key: &[u8], drawn: &[Vec<u8>]) {
         repl::nothing();
         return;
     }
-    if !db.hold(key).exists(key) {
+    if counted && !db.hold(key).exists(key) {
         repl::rewrite(&[b"DEL", key]);
         return;
     }
