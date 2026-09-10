@@ -1680,6 +1680,19 @@ impl Server {
         self.claimed = AtomicUsize::new(0);
     }
 
+    /// How many threads will run commands here.
+    ///
+    /// The number [`set_threads`](Self::set_threads) was given, and one on a
+    /// server nobody told, which is what `INFO` and `CONFIG GET io-threads`
+    /// answer. It counts the threads the server was built for rather than the
+    /// ones that have accepted a connection, for the same reason
+    /// [`per_thread`](Self::per_thread) has a row for a thread that has done
+    /// nothing: a thread that is waiting is still a thread that is there.
+    #[must_use]
+    pub fn io_threads(&self) -> usize {
+        self.locals.len()
+    }
+
     /// The `maxmemory` limit in bytes, zero when there is not one.
     #[must_use]
     pub fn maxmemory(&self) -> u64 {
@@ -8811,6 +8824,46 @@ mod tests {
             f.server.totals().commands
         );
         assert_eq!(per.iter().filter(|t| t.commands > 0).count(), 1, "{per:?}");
+    }
+
+    /// The three places the thread count is published all say the same number.
+    ///
+    /// `io_threads_active` and `io-threads` were both written down rather than
+    /// read, so a server started with four threads told every client it had one
+    /// and was not using it. A dashboard reading `INFO server` and a person
+    /// reading `CONFIG GET` are asking the same question the `# Threads` section
+    /// answers, and the three of them disagreeing is worse than any one of them
+    /// being missing.
+    #[test]
+    fn the_thread_count_is_the_same_number_wherever_it_is_asked_for() {
+        let mut f = Fixture::new();
+        assert!(f.run(&[b"INFO", b"server"]).contains("io_threads_active:1"));
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"io-threads"]),
+            "*2\r\n$10\r\nio-threads\r\n$1\r\n1\r\n"
+        );
+
+        let mut server = Server::new();
+        server.set_threads(4);
+        let mut f = Fixture::on(server);
+        let info = f.run(&[b"INFO", b"all"]);
+        assert!(info.contains("io_threads_active:4"), "{info}");
+        assert!(info.contains("io_threads:4"), "{info}");
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"io-threads"]),
+            "*2\r\n$10\r\nio-threads\r\n$1\r\n4\r\n"
+        );
+        // Immutable the way the fixed settings are, so the write that changes
+        // nothing is taken and every other one is refused.
+        assert_eq!(f.run(&[b"CONFIG", b"SET", b"io-threads", b"4"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"CONFIG", b"SET", b"io-threads", b"1"]),
+            "-ERR CONFIG SET failed (possibly related to argument 'io-threads') - can't set immutable config\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CONFIG", b"SET", b"io-threads", b"lots"]),
+            "-ERR CONFIG SET failed (possibly related to argument 'io-threads') - can't set immutable config\r\n"
+        );
     }
 
     /// The memory section says what this process may use, not what the machine

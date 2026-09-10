@@ -58,7 +58,6 @@ const SETTINGS: &[(&str, &str)] = &[
     // it at startup, because nothing in this build reads it from a file.
     ("backupdirname", backup::DIR_NAME),
     ("databases", "16"),
-    ("io-threads", "1"),
     ("proto-max-bulk-len", "536870912"),
     // How much of the command stream a master keeps for a replica that comes
     // back, which is a compiled in size here and happens to be the size Redis
@@ -131,6 +130,21 @@ const LADDER: &[(&str, Knob)] = &[
 /// their access field stays there and means something different from the moment
 /// the policy changes, which is what the `OBJECT FREQ` error text warns about.
 const MAXMEMORY_POLICY: &str = "maxmemory-policy";
+
+/// How many threads are running commands, which is whatever the server was
+/// started with.
+///
+/// Immutable like the settings in [`SETTINGS`] and read from the server rather
+/// than written down next to them, which is the whole reason it is out here: the
+/// number is decided at startup by whoever starts the threads, so the fixed `1`
+/// it used to be was a lie on every server started with more than one. A write
+/// to it is treated the way a write to a fixed setting is, so `CONFIG SET
+/// io-threads` takes the count the server already has and refuses the rest.
+///
+/// `INFO server` reports the same number under `io_threads_active`. Redis means
+/// the configured count by that field rather than the count of threads that have
+/// picked work up, and matching Redis is why the field is there at all.
+const IO_THREADS: &str = "io-threads";
 
 /// How much the server is allowed to hold before it starts evicting.
 ///
@@ -1158,6 +1172,7 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let fixed = SETTINGS.iter().filter(|(k, _)| wanted(k));
         let ladder = LADDER.iter().filter(|(k, _)| wanted(k));
         let policy = wanted(MAXMEMORY_POLICY);
+        let threads = wanted(IO_THREADS);
         let limit = wanted(MAXMEMORY);
         let store = wanted(MAXSTORE);
         let where_ = wanted(DIR);
@@ -1184,6 +1199,7 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
             fixed.clone().count()
                 + ladder.clone().count()
                 + usize::from(policy)
+                + usize::from(threads)
                 + usize::from(limit)
                 + usize::from(store)
                 + usize::from(where_)
@@ -1214,6 +1230,10 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         if policy {
             out.bulk(MAXMEMORY_POLICY.as_bytes());
             out.bulk(server.settings().policy().name().as_bytes());
+        }
+        if threads {
+            out.bulk(IO_THREADS.as_bytes());
+            out.bulk_int(server.io_threads() as i64);
         }
         if limit {
             // Back as a plain number of bytes whatever the client typed to set
@@ -1542,6 +1562,23 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                 count += 1;
                 continue;
             }
+            // The same rule the fixed settings follow, against a number that is
+            // read off the server instead of written down: a write of the count
+            // the server already has changes nothing and is taken, and anything
+            // else is refused, including a value that is not a number at all.
+            // The comparison is on the parsed number rather than on the text so
+            // that nothing here has to format the count into a buffer first.
+            if is(name, IO_THREADS.as_bytes()) {
+                if parse_i64(value) != Some(server.io_threads() as i64) {
+                    return Err(Error::fmt(
+                        Code::Unsupported,
+                        format_args!(
+                            "CONFIG SET failed (possibly related to argument '{IO_THREADS}') - can't set immutable config"
+                        ),
+                    ));
+                }
+                continue;
+            }
             let Some((k, v)) = SETTINGS.iter().find(|(k, _)| is(name, k.as_bytes())) else {
                 return Err(yo_alloc::allow(|| {
                     Error::fmt(
@@ -1699,7 +1736,7 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 "# Server\r\nredis_version:{REPORTED_VERSION}\r\nyo_version:{}\r\n\
                  redis_mode:{}\r\narch_bits:{}\r\nprocess_id:0\r\n\
                  run_id:0000000000000000000000000000000000000000\r\ntcp_port:{}\r\n\
-                 uptime_in_seconds:{}\r\nio_threads_active:0\r\n\r\n",
+                 uptime_in_seconds:{}\r\nio_threads_active:{}\r\n\r\n",
                 env!("CARGO_PKG_VERSION"),
                 if server.cluster_enabled() {
                     "cluster"
@@ -1712,6 +1749,10 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 // opened one, which is honest: there is no port.
                 server.announced_port(),
                 server.uptime_secs(),
+                // The configured count, which is what Redis means by this field:
+                // it is how many threads the server has for reading and writing
+                // and not how many are busy at the moment the client asked.
+                server.io_threads(),
             );
         }
         if want("clients") {
