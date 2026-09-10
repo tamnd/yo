@@ -1080,14 +1080,6 @@ resolved_by = "M9"
 spec = "12 section 9"
 
 [[divergence]]
-id = "D-152"
-title = "A master cannot be stood down by hand"
-reason = "A replica whose master the cluster has given up on stands for election, asks every master that serves a slot for a vote, and takes the slots over when it has a majority, which is the part that matters because it is the part that runs with nobody watching. What is not in is the failover an operator asks for on a master that is still up. That is CLUSTER FAILOVER on the replica, the MFSTART packet that tells the master to hold its clients still, the wait for the two offsets to meet and the FORCE and TAKEOVER forms that skip one half of it or both. The election underneath is the same one either way, and the flag that says the master is up and in on it is already honoured here, so a real server's replica doing a manual failover in a mixed cluster gets a vote from a yo node today. What a real server's replica does not get is a yo master that pauses its writes when asked, so it waits the five seconds out and gives up rather than promoting on a matched offset. Until then a master is moved by moving its slots, which is what a resharding tool does anyway."
-status = "until"
-resolved_by = "M8"
-spec = "12 section 9"
-
-[[divergence]]
 id = "D-153"
 title = "The replication heartbeat period is not a setting"
 reason = "A master pings a replication link that has gone quiet so that a replica can tell a link that has died from a master with nothing to say, and so that a server nobody is writing to still moves its offset. That is in, on its own thread, at the reference's default of ten seconds. What is not in is repl-ping-replica-period, along with repl-timeout and the rest of the replication settings, because the config table does not carry them yet and adding one of them without the others would leave a server that answers CONFIG GET for a setting it half implements. So the number is the default rather than a lookup, which is what nearly every deployment runs anyway, and the whole group goes in together with the config table work."
