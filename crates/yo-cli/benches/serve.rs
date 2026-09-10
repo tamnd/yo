@@ -45,10 +45,55 @@
 //! YO_BENCH_THREADS=1,2,4,8 YO_BENCH_PIPELINE=1,50 cargo bench -p yo-cli --bench serve
 //! YO_BENCH_CLIENTS=2 YO_BENCH_CONNS=8 cargo bench -p yo-cli --bench serve
 //! YO_BENCH_REPEATS=7 cargo bench -p yo-cli --bench serve
+//! YO_BENCH_OP=set cargo bench -p yo-cli --bench serve
 //! ```
 //!
 //! `YO_BENCH_SMOKE` cuts it to one short cell, which is what CI runs to find
 //! out that it still builds and still runs.
+//!
+//! # Reads or writes
+//!
+//! `YO_BENCH_OP` picks what the measured window sends, `get` by default and
+//! `set` for the other one. Both run against the same filled keyspace, so a
+//! `set` is an overwrite of a key that is already there rather than an insert,
+//! and what is measured is the write path rather than the map growing.
+//!
+//! Writes are worth measuring separately because they are not the same shape of
+//! work. A read takes a stripe's lock and copies a value out. A write takes the
+//! same lock, replaces the value, and then owes the rest of the server an
+//! account of what it did: keyspace notifications, the expiry sweep, and the
+//! replication feed. The published sweep has yo answering three to five reads
+//! for every write it answers where the engines beside it are nearer one for
+//! one, and that gap is what this mode exists to shorten the loop on.
+//!
+//! `YO_BENCH_OP_AGAINST` sets the far side of a pair, so the two halves differ
+//! by the operation and by nothing else and the ratio is what a write costs
+//! over a read. That is the form to use on a machine that will not hold still,
+//! for the same reason the paired build comparison is.
+//!
+//! ```text
+//! YO_BENCH_OP=set YO_BENCH_OP_AGAINST=get YO_BENCH_REPEATS=11 \
+//!   YO_BENCH_AGAINST=target/release/yodb cargo bench -p yo-cli --bench serve
+//! ```
+//!
+//! `YO_BENCH_SIZE` is how long a value is, `1` by default, and it takes a range
+//! as well as a number. `YO_BENCH_SIZE=1-1024` is the harness's
+//! `--data-size-range` and means the same thing: every value gets a length
+//! drawn from it, and the fill draws separately from the measured pass, so a
+//! write is over a value of some other length than the one already there.
+//!
+//! That is a different setting from `YO_BENCH_SIZE=1024` rather than a longer
+//! one, and the difference is the point. A `SET` over a value the length of the
+//! old one can reuse what is already allocated and a `SET` over a value of some
+//! other length cannot, so a bench that writes one length every time measures
+//! the first of those and calls it the write path. Anything being blamed on the
+//! write path wants checking at both.
+//!
+//! `YO_BENCH_KEYS` is how many keys each client thread cycles through, a
+//! hundred thousand by default against the two and a half million the harness
+//! holds. Anything the server does that walks the keyspace rather than one key
+//! of it costs nothing at the default and something at the harness's size, so
+//! a gap that only opens when this is turned up is a gap with a cause.
 //!
 //! # Comparing two builds on a machine that is not quiet
 //!
@@ -208,11 +253,29 @@ mod unix {
     const MEASURE: Duration = Duration::from_secs(3);
     const WARMUP: Duration = Duration::from_secs(1);
 
-    /// How many distinct keys each client thread cycles through.
+    /// How many distinct keys each client thread cycles through, unless the
+    /// environment says otherwise.
     ///
     /// Enough that this is a lookup rather than one cache line read over and
     /// over, and few enough that filling them is a second rather than a minute.
+    ///
+    /// It is worth turning up, because a server does not necessarily do the
+    /// same work per operation at every size. Anything that walks the keyspace
+    /// rather than one key of it, a rehash, an expiry sweep, a memory
+    /// accounting pass, costs nothing here and costs something at the two and a
+    /// half million keys the harness holds. Filling is the price: this many
+    /// keys of this many bytes get written down every connection's first
+    /// socket before the clock starts.
     const KEYS: usize = 100_000;
+
+    /// How long a value is, unless the environment says otherwise.
+    ///
+    /// One byte, which is the cheapest a value can be and is therefore the
+    /// setting that measures the server rather than `memcpy`. The harness draws
+    /// its lengths uniformly from `1-1024`, which is a different thing and not
+    /// only a longer one, so that is the setting to read beside a published
+    /// number.
+    const SIZE: &str = "1";
 
     /// How many times a cell is measured before one of its numbers is reported.
     ///
@@ -238,6 +301,18 @@ mod unix {
         let clients = one("YO_BENCH_CLIENTS", CLIENT_THREADS);
         let conns = one("YO_BENCH_CONNS", CONNS_PER_CLIENT);
         let repeats = one("YO_BENCH_REPEATS", if smoke { 1 } else { REPEATS });
+        let op = Op::parse(&text("YO_BENCH_OP"));
+        let sizes = Sizes::parse(&match std::env::var("YO_BENCH_SIZE") {
+            Ok(text) => text,
+            Err(_) => SIZE.to_owned(),
+        });
+        let keys = one("YO_BENCH_KEYS", KEYS);
+        // Same rule as the debug setup below: unset means the far side does
+        // what this one does, and set means the pair differs by that.
+        let op_against = match std::env::var("YO_BENCH_OP_AGAINST") {
+            Ok(name) => Op::parse(&name),
+            Err(_) => op,
+        };
         let (warmup, measure) = if smoke {
             (Duration::from_millis(100), Duration::from_millis(400))
         } else {
@@ -262,10 +337,17 @@ mod unix {
                 println!("that DEBUG {debug_against:?}");
             }
         }
+        let ops = if op == op_against {
+            op.as_str().to_owned()
+        } else {
+            format!("{} against {}", op.as_str(), op_against.as_str())
+        };
 
         let mut bad = 0;
         for pipeline in pipelines {
-            println!("\npipeline {pipeline}, {clients} client threads of {conns} connections");
+            println!(
+                "\n{ops} at pipeline {pipeline}, {clients} client threads of {conns} connections"
+            );
             if against.is_some() {
                 println!(
                     "{:>8}  {:>12}  {:>12}  {:>9}  {:>6}  {:>5}",
@@ -284,16 +366,30 @@ mod unix {
                     pipeline,
                     clients,
                     conns,
+                    keys,
+                    sizes,
                     warmup,
                     measure,
+                };
+                let this = Side {
+                    bin: &mine,
+                    at: 0,
+                    debug: &debug,
+                    op,
                 };
                 let mut rates = Vec::with_capacity(repeats);
                 let mut theirs = Vec::with_capacity(repeats);
                 let mut ratios = Vec::with_capacity(repeats);
                 for round in 0..repeats {
                     let Some(that) = &against else {
-                        rates.push(cell(&spec, &mine, 0, &debug));
+                        rates.push(cell(&spec, &this));
                         continue;
+                    };
+                    let that = Side {
+                        bin: that,
+                        at: 1,
+                        debug: &debug_against,
+                        op: op_against,
                     };
                     // Alternating, so that whichever binary goes first is not
                     // the same one every time. The first of a pair starts on a
@@ -301,11 +397,11 @@ mod unix {
                     // one that has just had a server killed on it, and that is
                     // a difference worth cancelling rather than measuring.
                     let (a, b) = if round % 2 == 0 {
-                        let a = cell(&spec, &mine, 0, &debug);
-                        (a, cell(&spec, that, 1, &debug_against))
+                        let a = cell(&spec, &this);
+                        (a, cell(&spec, &that))
                     } else {
-                        let b = cell(&spec, that, 1, &debug_against);
-                        (cell(&spec, &mine, 0, &debug), b)
+                        let b = cell(&spec, &that);
+                        (cell(&spec, &this), b)
                     };
                     rates.push(a);
                     theirs.push(b);
@@ -412,37 +508,84 @@ mod unix {
         (median, cv)
     }
 
+    /// What the measured window sends.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Op {
+        Get,
+        Set,
+    }
+
+    impl Op {
+        fn parse(name: &str) -> Op {
+            match name {
+                "" | "get" | "GET" => Op::Get,
+                "set" | "SET" => Op::Set,
+                other => panic!("YO_BENCH_OP is get or set, not {other:?}"),
+            }
+        }
+
+        /// How many line terminators one reply to this arrives in.
+        ///
+        /// A `GET` answers with a bulk string, which is a header line and a
+        /// body line. A `SET` answers `+OK`, which is one line.
+        fn lines(self) -> usize {
+            match self {
+                Op::Get => 2,
+                Op::Set => 1,
+            }
+        }
+
+        fn as_str(self) -> &'static str {
+            match self {
+                Op::Get => "get",
+                Op::Set => "set",
+            }
+        }
+    }
+
     /// One cell of the sweep: a server at one thread count, driven one way.
     struct Cell {
         threads: usize,
         pipeline: usize,
         clients: usize,
         conns: usize,
+        keys: usize,
+        sizes: Sizes,
         warmup: Duration,
         measure: Duration,
     }
 
+    /// One half of a pair, which unpaired means the only half there is.
+    ///
+    /// Everything here is allowed to differ between the two halves, and that is
+    /// the point of it. A pair whose sides differ by the binary compares two
+    /// builds, a pair whose sides differ by a `DEBUG` subcommand says what that
+    /// job costs, and a pair whose sides differ by the operation says what a
+    /// write costs over a read. All three are questions a busy machine can
+    /// answer paired and cannot answer one number at a time.
+    struct Side<'a> {
+        bin: &'a Path,
+        /// Only keeps the two off one socket path, so that a server taking its
+        /// time to die cannot be found by the run after it.
+        at: usize,
+        debug: &'a str,
+        op: Op,
+    }
+
     /// One server at one thread count, driven at one pipeline depth.
-    ///
-    /// The binary is a parameter rather than the one this bench was built
-    /// beside, which is what lets a pair of them be measured against each
-    /// other. `side` only keeps the two off one socket path, so that a server
-    /// taking its time to die cannot be found by the run after it.
-    ///
-    /// `debug` is per side rather than read from the environment down in the
-    /// client, because the two halves of a pair are allowed to be the same
-    /// build with a different job turned off, and that is how a cost gets
-    /// attributed on a machine that cannot hold still.
-    fn cell(cell: &Cell, bin: &Path, side: usize, debug: &str) -> f64 {
+    fn cell(cell: &Cell, side: &Side<'_>) -> f64 {
         let Cell {
             threads,
             pipeline,
             clients,
             conns: per_client,
+            keys,
+            sizes,
             warmup,
             measure,
         } = *cell;
-        let socket = socket_path(threads, pipeline, side);
+        let Side { bin, at, debug, op } = *side;
+        let socket = socket_path(threads, pipeline, at);
         let mut server = Server::start(bin, &socket, threads);
         server.wait_until_listening();
 
@@ -465,14 +608,14 @@ mod unix {
             hands.push(std::thread::spawn(move || {
                 let mut conns: Vec<UnixStream> =
                     (0..per_client).map(|_| connect(&socket)).collect();
-                let batches = Batches::new(id, pipeline);
+                let batches = Batches::new(id, pipeline, op, keys, sizes);
                 // One client sends them and the rest do not, because these
                 // change the server rather than the connection and sending
                 // them four times only means saying the same thing four times.
                 if id == 0 {
                     debug_setup(&mut conns[0], &debug);
                 }
-                fill(&mut conns[0], id);
+                fill(&mut conns[0], id, keys, sizes);
                 gate.wait();
                 let mut at = 0;
                 // The warmup runs the same loop and counts none of it, so what
@@ -521,15 +664,12 @@ mod unix {
             if conn.write_all(batch).is_err() {
                 continue;
             }
-            // Two terminators per reply, because a GET of a one byte value
-            // answers with a bulk string and a bulk string is a header line and
-            // a body line.
-            drain(conn, batches.pipeline * 2);
+            drain(conn, batches.pipeline * batches.lines);
         }
         at
     }
 
-    /// Every GET this client will ever send, encoded once.
+    /// Every command this client will ever send, encoded once.
     ///
     /// A load generator that formats a key on the hot path is measuring itself,
     /// so the whole key space goes into one buffer up front and a batch is a
@@ -540,18 +680,32 @@ mod unix {
         /// Where each batch starts, with a final entry for where the last ends.
         marks: Vec<usize>,
         pipeline: usize,
+        /// How many line terminators one reply arrives in.
+        lines: usize,
     }
 
     impl Batches {
-        fn new(client: usize, pipeline: usize) -> Batches {
-            let count = (KEYS / pipeline).max(1);
+        fn new(client: usize, pipeline: usize, op: Op, keys: usize, sizes: Sizes) -> Batches {
+            let value = value_of(sizes);
+            // Not the seed the fill used, so that a write is over a value of
+            // some other length than the one already there. That is what the
+            // harness does and it is the case an in place overwrite misses.
+            let mut seed = (client as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let count = (keys / pipeline).max(1);
             let mut buf = Vec::with_capacity(count * pipeline * 32);
             let mut marks = Vec::with_capacity(count + 1);
             let mut k = 0;
             for _ in 0..count {
                 marks.push(buf.len());
                 for _ in 0..pipeline {
-                    encode(&mut buf, &[b"GET", key_of(client, k).as_bytes()]);
+                    let key = key_of(client, k);
+                    match op {
+                        Op::Get => encode(&mut buf, &[b"GET", key.as_bytes()]),
+                        Op::Set => {
+                            let n = sizes.draw(&mut seed);
+                            encode(&mut buf, &[b"SET", key.as_bytes(), &value[..n]]);
+                        }
+                    }
                     k += 1;
                 }
             }
@@ -560,6 +714,7 @@ mod unix {
                 buf,
                 marks,
                 pipeline,
+                lines: op.lines(),
             }
         }
 
@@ -656,18 +811,26 @@ mod unix {
         }
     }
 
-    /// Write the keys this client will read, so that every measured GET hits.
+    /// Write the keys this client will use, before anything is measured.
     ///
     /// A hit and a miss are different amounts of work, so a bench over a
-    /// mixture of the two would be measuring the mixture.
-    fn fill(conn: &mut UnixStream, client: usize) {
+    /// mixture of the two would be measuring the mixture. That is why a `set`
+    /// run fills too: an overwrite and an insert are different amounts of work
+    /// as well, and a run that starts empty spends its window growing the map.
+    fn fill(conn: &mut UnixStream, client: usize, keys: usize, sizes: Sizes) {
         const AT_ONCE: usize = 256;
-        let mut out = Vec::with_capacity(AT_ONCE * 48);
+        let value = value_of(sizes);
+        let mut seed = client as u64 + 1;
+        let mut out = Vec::with_capacity(AT_ONCE * (48 + sizes.high));
         let mut owed = 0;
-        for k in 0..KEYS {
-            encode(&mut out, &[b"SET", key_of(client, k).as_bytes(), b"v"]);
+        for k in 0..keys {
+            let n = sizes.draw(&mut seed);
+            encode(
+                &mut out,
+                &[b"SET", key_of(client, k).as_bytes(), &value[..n]],
+            );
             owed += 1;
-            if owed == AT_ONCE || k + 1 == KEYS {
+            if owed == AT_ONCE || k + 1 == keys {
                 let _ = conn.write_all(&out);
                 // One terminator per reply here, because `SET` answers `+OK`.
                 drain(conn, owed);
@@ -718,6 +881,74 @@ mod unix {
     /// and the sharing being measured is the server's rather than the bench's.
     fn key_of(client: usize, k: usize) -> String {
         format!("bench:{client}:{k}")
+    }
+
+    /// How long a value is, which the harness draws from a range rather than
+    /// fixing.
+    ///
+    /// The difference matters more than it looks. A `SET` over a value that is
+    /// the length the old one was can reuse what is already allocated, and a
+    /// `SET` over a value that is some other length cannot. A bench that writes
+    /// one length every time is measuring the first of those and calling it the
+    /// write path.
+    #[derive(Clone, Copy)]
+    struct Sizes {
+        low: usize,
+        high: usize,
+    }
+
+    impl Sizes {
+        /// `N` for one length, `LOW-HIGH` for a length drawn from a range.
+        ///
+        /// The second spelling is `memtier`'s `--data-size-range` and means the
+        /// same thing it means there.
+        fn parse(text: &str) -> Sizes {
+            let (low, high) = match text.split_once('-') {
+                Some((low, high)) => (low, high),
+                None => (text, text),
+            };
+            let read = |part: &str| {
+                part.trim()
+                    .parse::<usize>()
+                    .unwrap_or_else(|_| panic!("YO_BENCH_SIZE is N or LOW-HIGH, not {text:?}"))
+                    .max(1)
+            };
+            let (low, high) = (read(low), read(high));
+            assert!(low <= high, "YO_BENCH_SIZE has {low} above {high}");
+            Sizes { low, high }
+        }
+
+        /// One length, and the seed moved on.
+        fn draw(self, seed: &mut u64) -> usize {
+            if self.low == self.high {
+                return self.low;
+            }
+            let span = (self.high - self.low + 1) as u64;
+            self.low + (roll(seed) % span) as usize
+        }
+    }
+
+    /// A buffer to cut values out of, as long as the longest one asked for.
+    ///
+    /// One byte repeated rather than anything random, because a value with a
+    /// carriage return in it would end a reply early and the reply reader here
+    /// counts line terminators rather than parsing.
+    fn value_of(sizes: Sizes) -> Vec<u8> {
+        vec![b'v'; sizes.high]
+    }
+
+    /// The next number out of a seed, and the seed moved on.
+    ///
+    /// Xorshift, because what this needs is lengths that do not repeat and a
+    /// run that does the same thing twice, and not randomness anybody would
+    /// defend.
+    fn roll(seed: &mut u64) -> u64 {
+        let mut x = *seed;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *seed = x;
+        x
     }
 
     /// A socket path this run owns, so two benches at once do not fight.
