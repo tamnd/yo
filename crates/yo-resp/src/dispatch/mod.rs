@@ -403,6 +403,43 @@ struct Local {
     /// Only the thread this belongs to reads or writes it, so it is a plain
     /// number in an atomic rather than anything that needs ordering.
     compact_db: AtomicUsize,
+    /// Which databases this thread has to weigh again before the total it
+    /// publishes means anything.
+    ///
+    /// One bit per database, the same shape as [`Local::dirty`] and set from the
+    /// same places, because the two questions have the same answer: a database
+    /// something ran against is a database whose memory may have moved. They are
+    /// two masks and not one because they are taken by different readers at
+    /// different rates, and a mask one of them cleared would be a mask the other
+    /// never saw.
+    ///
+    /// Starts with every database set, so the first reading a thread takes is a
+    /// walk over all of them rather than a sum of sixteen zeroes.
+    ///
+    /// Only the thread this belongs to reads or writes it. Another thread's
+    /// writes arrive through [`Server::collect_marks`], so a database that only
+    /// somebody else has written to is weighed again on the next collection
+    /// rather than on the next batch.
+    unmeasured: AtomicU64,
+    /// The millisecond this thread last took a memory reading.
+    ///
+    /// The gate that turns a reading a batch into a reading a millisecond. See
+    /// [`Server::refresh_memory_slice`] for why a reading that old is enough,
+    /// which comes down to the reading only having to be exact at the moment a
+    /// command is judged against the limit, and [`Server::make_room`] taking its
+    /// own at that moment.
+    ///
+    /// Only the thread this belongs to reads or writes it.
+    measure_ms: AtomicU64,
+    /// Which database this thread weighs again next whatever its mask says.
+    ///
+    /// One a reading, round robin, so a database that something changed without
+    /// marking it is out of date for at most sixteen readings rather than until
+    /// the next time a client happens to name it. What that costs is one
+    /// database's stripes on a reading that would otherwise have touched none.
+    ///
+    /// Only the thread this belongs to reads or writes it.
+    measure_db: AtomicUsize,
 }
 
 impl Local {
@@ -416,6 +453,9 @@ impl Local {
             parked: AtomicUsize::new(0),
             collect_ms: AtomicU64::new(u64::MAX),
             compact_db: AtomicUsize::new(at),
+            unmeasured: AtomicU64::new(ALL_DATABASES),
+            measure_ms: AtomicU64::new(u64::MAX),
+            measure_db: AtomicUsize::new(at),
         }
     }
 }
@@ -430,6 +470,51 @@ impl Local {
     /// Note that a command has run against these databases.
     fn mark(&self, dbs: u64) {
         self.dirty.store(self.dirty.load(Relaxed) | dbs, Relaxed);
+        self.unmeasure(dbs);
+    }
+
+    /// Note that what these databases hold may have changed since they were last
+    /// weighed.
+    ///
+    /// Every write goes through [`Local::mark`], which calls this. The places
+    /// that call it on their own are the ones that change what a database holds
+    /// without a command having asked: the expiry sweep, compaction and
+    /// eviction. A path that forgot would be out of date until
+    /// [`Local::measure_db`] came round to it rather than wrong for good.
+    fn unmeasure(&self, dbs: u64) {
+        self.unmeasured
+            .store(self.unmeasured.load(Relaxed) | dbs, Relaxed);
+    }
+
+    /// Take the mask of databases to weigh again, leaving it empty.
+    ///
+    /// A swap and not a read, because the reading that follows is what makes
+    /// them measured. A mark that lands during it is left set and is weighed on
+    /// the next reading, which is the same one batch of slack every other number
+    /// on this path already carries.
+    fn to_weigh(&self) -> u64 {
+        self.unmeasured.swap(0, Relaxed)
+    }
+
+    /// Which database to weigh again this reading whatever the mask says, moving
+    /// the cursor on for the next one.
+    fn measure_next(&self) -> usize {
+        let at = self.measure_db.load(Relaxed) % DATABASES;
+        self.measure_db.store((at + 1) % DATABASES, Relaxed);
+        at
+    }
+
+    /// Whether this thread has yet to take a memory reading on millisecond
+    /// `now`.
+    ///
+    /// The same shape as [`Local::collecting`] and for the same reason: the
+    /// caller asks on every batch and pays for it a thousand times a second.
+    fn measuring(&self, now: u64) -> bool {
+        if self.measure_ms.load(Relaxed) == now {
+            return false;
+        }
+        self.measure_ms.store(now, Relaxed);
+        true
     }
 
     /// Add `dbs` to what this thread's turn is going to look at.
@@ -688,6 +773,17 @@ pub struct Server {
     /// mid write gets one of the two readings and both of them were true a
     /// moment ago, which is all this number ever claims to be.
     used: AtomicUsize,
+    /// What each database was holding the last time anything read it.
+    ///
+    /// [`Server::settled_memory`] adds these up rather than walking the stripes
+    /// of every database, and re-reads a database only when something has marked
+    /// it since the last reading. Fifteen of the sixteen are empty on nearly
+    /// every server there is, and walking them was locking every stripe of every
+    /// one of them once a batch to be told the same number again.
+    ///
+    /// Shared and not per thread, so a database one thread re-read is a database
+    /// every thread has the fresh number for.
+    db_bytes: [AtomicUsize; DATABASES],
     /// What the server was holding before a client had written anything.
     ///
     /// `MEMORY STATS` reports it as `startup.allocated` and subtracts it from
@@ -1001,6 +1097,7 @@ impl Server {
             store: Lock::new(None),
             maxstore: AtomicU64::new(NO_MAXSTORE),
             used: AtomicUsize::new(0),
+            db_bytes: [const { AtomicUsize::new(0) }; DATABASES],
             startup: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             evict_db: AtomicUsize::new(0),
@@ -1090,6 +1187,7 @@ impl Server {
             store: Lock::new(None),
             maxstore: AtomicU64::new(NO_MAXSTORE),
             used: AtomicUsize::new(0),
+            db_bytes: [const { AtomicUsize::new(0) }; DATABASES],
             startup: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             evict_db: AtomicUsize::new(0),
@@ -1717,6 +1815,11 @@ impl Server {
         for db in &self.dbs {
             db.track_memory(bytes != 0);
         }
+        // Every database and not only the ones something has run against, since
+        // this is the walk the running totals start from and a database that
+        // takes its last reading from before the limit existed would be a
+        // database counted at whatever it held then.
+        self.mine().unmeasure(ALL_DATABASES);
         self.used.store(self.settled_memory(), Relaxed);
     }
 
@@ -1866,7 +1969,31 @@ impl Server {
         }
     }
 
-    /// Take a fresh memory reading, which the maintenance turn does once a batch.
+    /// The reading the shard loop takes, at most once a millisecond.
+    ///
+    /// The gate is the whole difference between this and
+    /// [`Server::refresh_memory`], and it is the same gate
+    /// [`Server::expire_slice`] puts in front of the expiry sweep. A maintenance
+    /// turn runs on every batch and a batch is a hundred nanoseconds, so a
+    /// reading a batch is ten thousand readings a millisecond of a number that
+    /// moves by what sixty four commands allocated.
+    ///
+    /// What a reading that old costs is overshoot, and it is bounded by what a
+    /// millisecond of writes can allocate. That is far inside the tolerance this
+    /// number already has: space comes back a segment at a time and a segment is
+    /// two megabytes, so the limit was never held to closer than that.
+    ///
+    /// The case that matters is a server sitting at its limit, and that one is
+    /// not judged on this reading at all. [`Server::make_room`] takes its own the
+    /// moment the cached one says the server is over, which is the moment the
+    /// number has to be exact.
+    pub fn refresh_memory_slice(&self) {
+        if self.maxmemory() != 0 && self.mine().measuring(self.clock.now_ms()) {
+            self.refresh_memory();
+        }
+    }
+
+    /// Take a fresh memory reading.
     ///
     /// Nothing at all when there is no limit, which is the default and is every
     /// server that has not asked for one.
@@ -1885,15 +2012,34 @@ impl Server {
 
     /// [`Server::memory_bytes`], asked the cheap way.
     ///
-    /// The same number. The difference is that this asks each database only
-    /// about the collections that could have moved since the last time, which is
-    /// what a batch touched rather than what the server holds, so it can be
-    /// asked once a batch and again on every command that is over the limit.
+    /// Two things make it cheaper and they cut different ways. A database that
+    /// has been marked is asked only about the collections that could have moved
+    /// since the last time rather than about everything it holds, which is
+    /// [`Keyspace::settled_memory_bytes`]. A database that has not been marked is
+    /// not asked at all and its last reading is used instead, which is what keeps
+    /// the fifteen empty databases nearly every server has off a path that runs
+    /// once a batch.
+    ///
+    /// One more database is weighed than the mask asked for, round robin, so
+    /// that a reading cannot be stale for good if something changed a database
+    /// without saying so.
     fn settled_memory(&self) -> usize {
-        self.keyspaces()
-            .map(|mut db| db.settled_memory_bytes())
-            .sum::<usize>()
-            + self.conn_bytes()
+        let mine = self.mine();
+        let marked = mine.to_weigh() | 1u64 << mine.measure_next();
+        let mut total = self.conn_bytes();
+        for at in 0..DATABASES {
+            if marked & (1u64 << at) == 0 {
+                total += self.db_bytes[at].load(Relaxed);
+                continue;
+            }
+            let db = &self.dbs[at];
+            let now = (0..db.width())
+                .map(|i| db.hold_stripe(i).settled_memory_bytes())
+                .sum::<usize>();
+            self.db_bytes[at].store(now, Relaxed);
+            total += now;
+        }
+        total
     }
 
     /// Make room under the `maxmemory` limit, throwing keys away if that is what
@@ -2091,6 +2237,9 @@ impl Server {
             if c.expired > 0 {
                 self.expire_db.store((i + 1) % slots, Relaxed);
                 self.mine().note(1u64 << self.slot_db(i));
+                // Keys the sweep took are bytes the database no longer holds,
+                // and nothing else is going to say so: no command ran.
+                self.mine().unmeasure(1u64 << self.slot_db(i));
             }
         }
         spent
@@ -2108,6 +2257,10 @@ impl Server {
             let i = (from + turn) % self.slots();
             if let Some(moved) = self.slot(i).compact_hard() {
                 self.next_db.store((i + 1) % self.slots(), Relaxed);
+                // A segment handed back is the whole point of the call, and
+                // `make_room` reads the total again on the next turn of its loop
+                // to find out whether it worked.
+                self.mine().unmeasure(1u64 << self.slot_db(i));
                 return Some(moved);
             }
         }
@@ -2127,7 +2280,14 @@ impl Server {
         for thread in &self.locals {
             marked |= thread.dirty.swap(0, Relaxed);
         }
-        self.mine().note(marked);
+        let mine = self.mine();
+        mine.note(marked);
+        // The other half of what the marks are for. A thread weighs the
+        // databases its own commands touched on every reading it takes, and this
+        // is where it hears about the ones somebody else touched. Oring in a bit
+        // it has already weighed costs one database on one reading, which is why
+        // this can share a mask that was collected for something else.
+        mine.unmeasure(marked);
     }
 
     /// Give one database's dead space back, if any database has enough of it to
@@ -2177,6 +2337,9 @@ impl Server {
             }
             if let Some(moved) = self.slot(i).compact_step() {
                 mine.compact_db.store((i + 1) % slots, Relaxed);
+                // The same as the hard step: the segment it gave back is memory
+                // the next reading would otherwise still be counting.
+                mine.unmeasure(1u64 << at);
                 return Some(moved);
             }
             // Only once every stripe of the database has said it has nothing,
@@ -8288,6 +8451,92 @@ mod tests {
             f.server.memory_bytes(),
             "the writes it was not watching are in the number it started from"
         );
+    }
+
+    /// A reading adds up sixteen databases and only weighs the ones that moved,
+    /// so the ones it did not weigh have to be in the total at what they were
+    /// holding when it last did.
+    ///
+    /// The walk is the number this is checked against, because the walk is what
+    /// the server actually holds. Getting this wrong in the direction that
+    /// forgets a database is a limit enforced against a fiction, and in the other
+    /// direction it is a server evicting keys to get under a number it is already
+    /// under.
+    #[test]
+    fn a_database_nobody_has_touched_is_still_in_the_total() {
+        let mut f = Fixture::new();
+        f.run(&[b"CONFIG", b"SET", b"maxmemory", b"1gb"]);
+        f.run(&[b"SELECT", b"3"]);
+        for i in 0..200u32 {
+            let n = i.to_string();
+            f.run(&[b"SADD", b"s", n.as_bytes()]);
+        }
+        f.run(&[b"SELECT", b"0"]);
+        for i in 0..200u32 {
+            let k = format!("key:{i}");
+            f.run(&[b"SET", k.as_bytes(), b"value"]);
+        }
+
+        // More readings in a row than there are databases, with nothing running
+        // in between, so every one of them after the first is answering mostly
+        // out of what it remembers.
+        for turn in 0..DATABASES * 2 {
+            assert_eq!(
+                f.server.settled_memory(),
+                f.server.memory_bytes(),
+                "reading {turn}"
+            );
+        }
+
+        // And a database that empties while it is not the selected one is not
+        // still counted at what it used to hold.
+        f.run(&[b"SELECT", b"3"]);
+        f.run(&[b"FLUSHDB"]);
+        f.run(&[b"SELECT", b"0"]);
+        assert_eq!(f.server.settled_memory(), f.server.memory_bytes());
+    }
+
+    /// One database is weighed again on every reading whatever the marks say, so
+    /// a change nothing marked is out of date for a while rather than for good.
+    ///
+    /// The marks are thrown away by hand here, which is what a path that changed
+    /// a database and did not say so would leave behind. Sixteen readings is the
+    /// worst case, because the cursor moves one database a reading.
+    #[test]
+    fn a_change_nothing_marked_is_found_within_a_turn_of_the_databases() {
+        let mut f = Fixture::new();
+        f.run(&[b"CONFIG", b"SET", b"maxmemory", b"1gb"]);
+        f.server.settled_memory();
+        f.run(&[b"SELECT", b"7"]);
+        for i in 0..200u32 {
+            let n = i.to_string();
+            f.run(&[b"SADD", b"s", n.as_bytes()]);
+        }
+        f.server.mine().to_weigh();
+
+        let walk = f.server.memory_bytes();
+        let mut readings = 0;
+        while f.server.settled_memory() != walk {
+            readings += 1;
+            assert!(readings < DATABASES, "still out of date after {readings}");
+        }
+    }
+
+    /// The reading is taken once a millisecond and not once a batch, and the
+    /// gate is what says so.
+    ///
+    /// A batch is a hundred nanoseconds, so the difference between the two is
+    /// four orders of magnitude of walking the databases to be told the same
+    /// number back.
+    #[test]
+    fn a_thread_takes_one_memory_reading_a_millisecond() {
+        let f = Fixture::new();
+        let mine = f.server.mine();
+        assert!(mine.measuring(7));
+        assert!(!mine.measuring(7));
+        assert!(!mine.measuring(7));
+        assert!(mine.measuring(8));
+        assert!(!mine.measuring(8));
     }
 
     #[test]
