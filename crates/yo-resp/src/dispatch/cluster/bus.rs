@@ -1689,6 +1689,8 @@ fn cron(server: &Arc<Server>) {
             server.cluster.bus.dirty.store(true, Relaxed);
         }
         server.recount_coverage();
+        server.asm_cron();
+        server.asm_relax();
         // The file is written at most ten times a second and only when something
         // moved, which keeps a busy cluster from writing it on every packet.
         if tick.is_multiple_of(10) && server.cluster.bus.dirty.swap(false, Relaxed) {

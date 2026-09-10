@@ -1727,6 +1727,9 @@ fn migration(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
             }
         } else {
             out.int(server.cluster.asm.cancel(id, server.now_ms() as i64));
+            // A cancelled handoff is not one whose write pause anybody should
+            // have to wait out.
+            server.asm_relax();
         }
         return Ok(());
     }
