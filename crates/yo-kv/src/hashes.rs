@@ -274,6 +274,10 @@ impl Keyspace {
         };
         let now = self.clock.now_ms();
         let listed = self.hash_at(slot).takes_deadlines();
+        // Before the fields are looked for and not after, which is the order a
+        // real server does it in and which is why a call naming a field that is
+        // not there still widens the hash.
+        self.hash_at_mut(slot).widen();
         let mut emptied = false;
         for field in fields {
             let hash = self.hash_at_mut(slot);
@@ -821,7 +825,11 @@ impl Keyspace {
     /// anything, so what this tests is the change and not the state. A hash
     /// crosses that line once, the first time a deadline lands on it, which is
     /// what keeps one name on the list per hash however many times the
-    /// `HEXPIRE` family is called on it.
+    /// `HEXPIRE` family is called on it. What is on the hash now is asked as
+    /// whether it has anything to expire rather than as whether it could,
+    /// because the `HEXPIRE` family widens a hash before it knows whether any
+    /// of the fields it was given are there, and a hash that was widened for
+    /// nothing has nothing for the sweep to do.
     ///
     /// The one case that gets past the change test is a key that was deleted and
     /// made again before the sweep noticed the first one, since the new hash
@@ -830,7 +838,7 @@ impl Keyspace {
     /// in a loop, and anything else costs a second name for a key that is really
     /// there and is really worth sweeping.
     fn watch_fields(&mut self, key: &[u8], at: u32, listed: bool) {
-        if listed || !self.hash_at(at).takes_deadlines() {
+        if listed || self.hash_at(at).soonest_deadline().is_none() {
             return;
         }
         if self

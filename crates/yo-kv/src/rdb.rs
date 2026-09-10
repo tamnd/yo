@@ -489,10 +489,22 @@ pub(crate) fn object(rec: &Record, key: Option<&[u8]>, out: &mut Vec<u8>) -> boo
             None => {
                 put_head(out, T_ZSET_2, key);
                 put_len(out, zset.len() as u64);
-                zset.walk(0, zset.len(), false, |member, score| {
-                    put_entry(out, member);
-                    out.extend_from_slice(&score.to_le_bytes());
-                });
+                // Highest score first, which is what Redis writes and which is
+                // not an arbitrary choice on either side. A reader building a
+                // skiplist from a descending payload puts every member at the
+                // head of the list it is building, so the insert is a constant
+                // rather than a search. Walking the other way here would give
+                // the same sorted set back and a payload that is a different
+                // string of bytes from the one a real server writes.
+                zset.walk(
+                    zset.len().saturating_sub(1),
+                    zset.len(),
+                    true,
+                    |member, score| {
+                        put_entry(out, member);
+                        out.extend_from_slice(&score.to_le_bytes());
+                    },
+                );
             }
         },
         Body::Hash(hash) => put_hash(out, hash, key),
@@ -509,15 +521,33 @@ fn put_head(out: &mut Vec<u8>, ty: u8, key: Option<&[u8]>) {
     }
 }
 
-/// A hash, in the plain shape or the one that carries field deadlines.
+/// A hash, in whichever of the four shapes matches the band it is in.
 ///
-/// Two types because the deadline costs a length prefixed number on every single
-/// field, and the overwhelming majority of hashes have no deadline anywhere.
-/// Redis makes the same split for the same reason, and the trick it uses is
-/// worth copying: the earliest deadline in the hash goes in the header, and each
-/// field stores the difference from it plus one, so a field with no deadline is
-/// a zero and everything else is a small number rather than a full timestamp.
+/// Four types because a deadline costs a length prefixed number on every single
+/// field and the overwhelming majority of hashes have no deadline anywhere, and
+/// because a hash small enough to be one blob goes out as that blob either way.
+/// Redis makes both splits for both reasons and the type follows the encoding
+/// rather than the contents, so a hash that had deadlines and has lost them all
+/// still goes out under the type that can carry them, which is what keeps
+/// `OBJECT ENCODING` the same on both sides of a reload.
+///
+/// The trick the two deadline types use is worth writing down: the earliest
+/// deadline in the hash goes in the header, and in the table shape each field
+/// stores the difference from it plus one, so a field with no deadline is a
+/// nought and everything else is a small number rather than a full timestamp.
+/// The packed shape does not do that, because there the deadlines are already
+/// sitting in the blob as the third element of every row.
 fn put_hash(out: &mut Vec<u8>, hash: &Hash, key: Option<&[u8]>) {
+    if let Some(blob) = hash.packed_ex_bytes() {
+        put_head(out, T_HASH_LISTPACK_EX, key);
+        // A nought where there is nothing left to expire, which is what the
+        // reference writes for the same case. The reader on both servers takes
+        // this as a hint and works the real bound out from the rows, so a bound
+        // that is early costs a walk and never a wrong answer.
+        out.extend_from_slice(&hash.soonest_deadline().unwrap_or(0).to_le_bytes());
+        put_str(out, blob);
+        return;
+    }
     let Some(soonest) = hash.soonest_deadline() else {
         if let Some(blob) = hash.packed_bytes() {
             put_head(out, T_HASH_LISTPACK, key);
@@ -1252,17 +1282,18 @@ fn read_hash_listpack(
     if lp.is_empty() || lp.len() % step != 0 {
         return Err(Bad::Format);
     }
-    // The payload is already the layout the packed band uses, so take it whole
-    // rather than set a field at a time. Only the two element form: the deadline
-    // column is a band this cannot hand over, for the reason `packed_bytes`
-    // refuses to copy it on the way out.
-    let lp = if with_ttl {
-        lp
+    // The payload is already the layout one of the packed bands uses, so take it
+    // whole rather than set a field at a time. Either form: the three element
+    // one goes into the wider band as it stands and keeps being the wider band,
+    // which is what a real server does with the same bytes.
+    let taken = if with_ttl {
+        Hash::from_packed_ex(lp, limits, now)
     } else {
-        match Hash::from_packed(lp, limits) {
-            Ok(hash) => return Ok(Body::Hash(hash)),
-            Err(lp) => lp,
-        }
+        Hash::from_packed(lp, limits)
+    };
+    let lp = match taken {
+        Ok(hash) => return Ok(Body::Hash(hash)),
+        Err(lp) => lp,
     };
     let mut hash = Hash::with_hint(lp.len() / step, limits);
     let mut field_buf = [0u8; DIGITS_MAX];
@@ -1818,9 +1849,13 @@ mod tests {
         }
     }
 
-    /// A hash that has been widened for deadlines is walked even once they have
-    /// all gone, because the blob it holds still has the third element per field
-    /// and `HASH_LISTPACK` has no room for it.
+    /// A hash that has been widened for deadlines keeps the type that can carry
+    /// them even once they have all gone, because the blob it holds still has
+    /// the third element per field and `HASH_LISTPACK` has no room for it.
+    ///
+    /// The header in front of the blob is a nought there, since there is no
+    /// deadline left to name, which is what the reference writes for the same
+    /// hash.
     #[test]
     fn a_widened_hash_is_not_copied() {
         let l = hash::Limits::DEFAULT;
@@ -1835,12 +1870,15 @@ mod tests {
         assert_eq!(hash.encoding(), hash::Encoding::ListpackEx);
         assert_eq!(hash.soonest_deadline(), None);
         let rec = Record::new(Body::Hash(hash.clone()), None);
-        assert_eq!(dump(&rec).expect("a hash has an RDB shape")[0], T_HASH);
+        let payload = dump(&rec).expect("a hash has an RDB shape");
+        assert_eq!(payload[0], T_HASH_LISTPACK_EX);
+        assert_eq!(&payload[1..9], &0u64.to_le_bytes());
         let Body::Hash(back) = round_trip(Body::Hash(hash)) else {
             panic!("a hash came back as something else");
         };
         assert_eq!(back.len(), 1);
         assert_eq!(back.deadline(b"one"), Ask::NoDeadline);
+        assert_eq!(back.encoding(), hash::Encoding::ListpackEx);
     }
 
     #[test]
@@ -1851,10 +1889,11 @@ mod tests {
         hash.set(b"timed", b"2", &l);
         hash.expire(b"timed", 5_000, Cond::Always, 1_000);
         let rec = Record::new(Body::Hash(hash.clone()), None);
-        assert_eq!(
-            dump(&rec).expect("a hash has an RDB shape")[0],
-            T_HASH_METADATA
-        );
+        let payload = dump(&rec).expect("a hash has an RDB shape");
+        // Small enough to be one blob, so it goes out as the packed type with
+        // the earliest deadline in front of it rather than as the table.
+        assert_eq!(payload[0], T_HASH_LISTPACK_EX);
+        assert_eq!(&payload[1..9], &5_000u64.to_le_bytes());
         let (s, h, li, z) = limits();
         let all = Limits {
             set: &s,
@@ -1869,6 +1908,30 @@ mod tests {
         assert_eq!(back.len(), 2);
         assert_eq!(back.deadline(b"timed"), crate::ttl::Ask::At(5_000));
         assert_eq!(back.deadline(b"keep"), crate::ttl::Ask::NoDeadline);
+    }
+
+    /// Past the packed band a hash with deadlines is the table shape instead,
+    /// which is the one where every field carries its own offset from the bound
+    /// in the header.
+    #[test]
+    fn a_big_hash_with_deadlines_is_the_table_shape() {
+        let l = hash::Limits::DEFAULT;
+        let mut hash = Hash::new();
+        for i in 0..600 {
+            hash.set(format!("field {i}").as_bytes(), b"value", &l);
+        }
+        hash.expire(b"field 7", 5_000, Cond::Always, 1_000);
+        assert_eq!(hash.encoding(), hash::Encoding::Hashtable);
+        let rec = Record::new(Body::Hash(hash.clone()), None);
+        let payload = dump(&rec).expect("a hash has an RDB shape");
+        assert_eq!(payload[0], T_HASH_METADATA);
+        assert_eq!(&payload[1..9], &5_000u64.to_le_bytes());
+        let Body::Hash(back) = round_trip(Body::Hash(hash)) else {
+            panic!("a hash came back as something else");
+        };
+        assert_eq!(back.len(), 600);
+        assert_eq!(back.deadline(b"field 7"), Ask::At(5_000));
+        assert_eq!(back.deadline(b"field 8"), Ask::NoDeadline);
     }
 
     /// A field whose deadline went while the payload was in flight is not put
