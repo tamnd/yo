@@ -85,6 +85,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize};
+use std::time::Duration;
 
 use core::cell::{Cell, RefCell};
 
@@ -197,6 +198,9 @@ pub(crate) struct Replication {
     /// command on any database is preceded by a `SELECT` even for database
     /// zero.
     on_db: AtomicI64,
+    /// When something last went out on the stream, so the periodic `PING` a
+    /// master owes its replicas is only sent on a link that has gone quiet.
+    last_io: AtomicU64,
 }
 
 impl Default for Replication {
@@ -213,6 +217,7 @@ impl Default for Replication {
             frozen: AtomicBool::new(false),
             building: Lock::new(()),
             on_db: AtomicI64::new(-1),
+            last_io: AtomicU64::new(0),
         }
     }
 }
@@ -665,6 +670,61 @@ impl Server {
     }
 }
 
+// ------------------------------------------------------------ the heartbeat
+
+/// How long a quiet replication link goes before its master pings it.
+///
+/// Ten seconds is `repl-ping-replica-period`'s default. The setting itself is
+/// not in the config table yet, so this is the number rather than a lookup.
+const PING_REPLICAS_MS: u64 = 10_000;
+
+/// How often the heartbeat thread wakes up to see whether one is due.
+const HEARTBEAT_MS: u64 = 1000;
+
+impl Server {
+    /// Start the thread that pings the replicas of a quiet master.
+    ///
+    /// A master pings so that a replica can tell a link that has gone away from
+    /// a master with nothing to say, since a TCP connection that nobody writes
+    /// to gives no sign either way. It is also what moves the offset on a server
+    /// nobody is writing to, and a replica whose offset is still zero is one a
+    /// real server leaves out of `CLUSTER SLOTS` on the grounds that it has
+    /// never caught up with anything.
+    ///
+    /// Its own thread because the housekeeping the engine does runs per batch,
+    /// so a server with no traffic does none of it, and a server with no traffic
+    /// is exactly the one that owes its replicas a ping.
+    pub fn start_replica_heartbeat(self: &Arc<Server>) {
+        let beating = Arc::clone(self);
+        yo_alloc::allow(|| {
+            let _ = std::thread::Builder::new()
+                .name(String::from("yo-repl-ping"))
+                .spawn(move || heartbeat(&beating));
+        });
+    }
+}
+
+/// One ping every `PING_REPLICAS_MS` on a link that has been quiet that long.
+fn heartbeat(server: &Arc<Server>) {
+    loop {
+        std::thread::sleep(Duration::from_millis(HEARTBEAT_MS));
+        // Only a top level master. A replica passes on the stream it is given
+        // rather than writing one, so a ping from here would put bytes in the
+        // middle of somebody else's history.
+        if !server.replicated() || server.following() {
+            continue;
+        }
+        let now = server.now_ms();
+        if now.saturating_sub(server.repl.last_io.load(Relaxed)) < PING_REPLICAS_MS {
+            continue;
+        }
+        // No `SELECT` in front of it, which is what the reference's `dictid` of
+        // minus one means: a ping touches no key, so it does not move the
+        // stream's database and must not look as though it did.
+        emit(server, render(&[b"PING"]));
+    }
+}
+
 // ---------------------------------------------------------------- the feed
 
 /// One command as a RESP array, which is the only shape the stream has.
@@ -689,6 +749,7 @@ fn render(parts: &[&[u8]]) -> Vec<u8> {
 /// never disagree. A replica attaching between the two would otherwise be given
 /// an offset the backlog cannot honour.
 fn emit(server: &Server, bytes: Vec<u8>) {
+    server.repl.last_io.store(server.now_ms(), Relaxed);
     let shared = {
         let mut backlog = server.repl.backlog.lock();
         let upto = server.repl.offset.load(Relaxed) + bytes.len() as u64;

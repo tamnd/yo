@@ -672,6 +672,13 @@ impl Server {
     /// If a worker thread panicked, which is carried out to this thread rather
     /// than swallowed.
     pub fn run(&mut self, stop: &AtomicBool) -> io::Result<()> {
+        // The bus goes up before the first client does, because a cluster node
+        // that answered a client before it had found the rest of the cluster
+        // would answer for slots it is about to be told are not its.
+        self.shared.start_cluster_bus().map_err(io::Error::other)?;
+        // And the heartbeat, which is what keeps a replication link that nobody
+        // is writing to from looking to the replica like a master that has gone.
+        self.shared.start_replica_heartbeat();
         let mut workers = Vec::with_capacity(self.threads);
         let split = Arc::new(Split::new(self.threads));
         for me in 0..self.threads {
