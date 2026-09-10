@@ -419,7 +419,8 @@ const AC_KEY_WRITE_SLOW: &[&str] = &["@keyspace", "@write", "@slow"];
 /// `UNLINK`, which Redis does count as fast because it does not, and the
 /// expiry writers, which move a deadline and never touch a value.
 const AC_KEY_WRITE_FAST: &[&str] = &["@keyspace", "@write", "@fast"];
-/// The two that empty a database, which are in the dangerous category.
+/// The two that empty a database, which are in the dangerous category, and
+/// `TRIMSLOTS`, which empties a slot range for the same reason.
 const AC_KEY_FLUSH: &[&str] = &["@keyspace", "@write", "@slow", "@dangerous"];
 /// `SWAPDB`, which is fast and dangerous at the same time. It is two pointer
 /// writes and it changes what every connected client is looking at, so Redis
@@ -6919,6 +6920,24 @@ pub static COMMANDS: &[Spec] = &[
         since: "3.0.0",
         complexity: "O(1)",
         summary: "The sixteen thousand slots and who owns each of them.",
+        group: "server",
+    },
+    // The one command a slot migration leaves on the replication stream. A node
+    // that has handed slots over writes one of these so that whoever follows it
+    // drops the same keys, and nobody else has any reason to send it. It names
+    // no key and it is still a write, since it takes keys away.
+    Spec {
+        name: "trimslots",
+        arity: -5,
+        flags: &["write"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        keys: &[],
+        acl: AC_KEY_FLUSH,
+        since: "8.4.0",
+        complexity: "O(N) in the number of keys on the server.",
+        summary: "Drop the keys of slot ranges this node does not serve.",
         group: "server",
     },
     // The three connection commands cluster mode adds. All three are `fast`,

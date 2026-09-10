@@ -1805,6 +1805,53 @@ fn slot_ranges(args: &Args<'_>, from: usize) -> Result<Vec<(u16, u16)>> {
     Ok(joined)
 }
 
+/// `TRIMSLOTS`, which drops the keys of slot ranges this node does not serve.
+///
+/// Not a command an operator has any reason to type, and it is a top level
+/// command rather than a `CLUSTER` subcommand because of where it is sent from:
+/// a node that has just handed slots over writes one of these to its replicas
+/// and its append only file, so that a replica drops the same keys its master
+/// just dropped rather than going on answering for data that has moved. One
+/// command for the ranges rather than a deletion per key, because a slot range
+/// can hold millions of keys and the far side can work the list out for itself.
+///
+/// The refusal in the middle is the one that matters. A node will not empty a
+/// slot it is serving, whatever it is told, so a `TRIMSLOTS` that arrives late
+/// or names the wrong range cannot take live data with it. A replica does not
+/// make that check, because the slots are its master's and not its own and it is
+/// being told what its master already did.
+pub(super) fn trimslots(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
+    if !server.cluster_enabled() {
+        return Err(disabled());
+    }
+    if !args::is(args.get(1), b"ranges") {
+        return Err(Error::new(Code::Invalid, "missing ranges argument"));
+    }
+    let count = args.int(2)?;
+    if count < 1 || count > SLOTS as i64 || args.len() as i64 != 3 + count * 2 {
+        return Err(Error::new(Code::Invalid, "invalid number of ranges"));
+    }
+    let ranges = slot_ranges(&args, 3)?;
+    {
+        let map = server.cluster.map.lock();
+        if map.nodes[0].is_master() {
+            for &(from, to) in &ranges {
+                for slot in from..=to {
+                    if map.owner[usize::from(slot)] == Some(0) {
+                        return Err(Error::fmt(
+                            Code::Invalid,
+                            format_args!("the slot {slot} is served by this node"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    server.trim_named_slots(&ranges);
+    out.ok();
+    Ok(())
+}
+
 /// `CLUSTER SYNCSLOTS`, which is what two nodes say to each other while a slot
 /// range moves from one to the other under atomic slot migration.
 ///

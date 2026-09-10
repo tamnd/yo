@@ -440,6 +440,9 @@ pub(super) fn execute(
         "replicaof" | "slaveof" => super::follow::replicaof(server, args, out)?,
         "failover" => super::failover::execute(server, args, out)?,
         "cluster" => super::cluster::execute(server, session, args, out)?,
+        // A top level command rather than a `CLUSTER` subcommand, and only ever
+        // sent by a node that has handed slots over to whoever is following it.
+        "trimslots" => super::cluster::trimslots(server, args, out)?,
         // The three connection commands cluster mode adds. `ASKING` is the one
         // that does anything: it says the next command is allowed into a slot
         // this node is receiving and does not own yet, which is how a client

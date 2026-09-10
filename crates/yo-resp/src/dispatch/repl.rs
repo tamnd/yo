@@ -806,6 +806,17 @@ fn send(server: &Server, db: usize, parts: &[&[u8]]) {
     emit(server, bytes);
 }
 
+/// Put one command on the stream from outside a command.
+///
+/// The funnel below is arranged around a client running something, and there is
+/// one thing that reaches it without one: the bus, dropping the keys of a slot
+/// that has just moved to another node. That happens on a bus thread with no
+/// session and no arguments to fall back on, so the caller says exactly what to
+/// send and this is the door it goes through.
+pub(super) fn announce(server: &Server, db: usize, parts: &[&[u8]]) {
+    send(server, db, parts);
+}
+
 /// Pass a master's bytes on, unchanged, and count them.
 ///
 /// What a replica owes anybody following it is the stream it was given rather

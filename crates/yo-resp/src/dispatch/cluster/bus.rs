@@ -805,6 +805,16 @@ struct Todo {
     save: bool,
     /// Whether the slot coverage needs counting again once the lock is gone.
     recount: bool,
+    /// Slots this node was serving and is not any more.
+    ///
+    /// Carried out of the lock rather than acted on inside it, because what
+    /// happens to them is a migration finishing and a walk of the keyspace, and
+    /// neither of those is a thing to do while every command on the server is
+    /// waiting on the map.
+    lost: Vec<u16>,
+    /// Whether giving them away left this node following the node that took
+    /// them, which is a node that keeps its keys rather than dropping them.
+    demoted: bool,
     /// Whether the link should be closed rather than read again.
     close: bool,
 }
@@ -849,6 +859,10 @@ fn process(server: &Arc<Server>, wire: &Arc<Wire>, p: &[u8]) -> bool {
     if todo.recount {
         server.recount_coverage();
     }
+    // Last, and outside the lock. A slot that has gone to somebody else is where
+    // a migration ends and where the keys behind it stop being this node's, and
+    // both of those read the map they would otherwise be holding.
+    server.asm_slots_moved(&todo.lost, todo.demoted);
     !todo.close
 }
 
@@ -1527,6 +1541,7 @@ fn claim_slots(
         }
         if held == Some(0) {
             lost += 1;
+            yo_alloc::allow(|| todo.lost.push(slot as u16));
         }
         map.owner[slot] = Some(owner);
         map.migrating[slot] = None;
@@ -1536,6 +1551,7 @@ fn claim_slots(
     // Following the node that took them is what a real server does and is what
     // makes a failed master come back as a replica of whoever replaced it.
     if lost > 0 && map.runs(0).is_empty() && owner != 0 {
+        todo.demoted = true;
         map.nodes[0].flags &= !FLAG_MASTER;
         map.nodes[0].flags |= FLAG_SLAVE;
         map.nodes[0].master = Some(owner);
