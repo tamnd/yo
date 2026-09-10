@@ -61,6 +61,7 @@ mod asm;
 mod bus;
 use super::keyspec;
 use super::table::Spec;
+pub(super) use asm::Migration;
 
 /// How many slots a cluster has, which is Redis's number and is not a setting.
 ///

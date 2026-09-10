@@ -15,6 +15,7 @@
 //! `COMMAND INFO` are simple strings inside an array rather than bulk strings.
 
 use super::args::{self, Args, is};
+use super::cluster::Migration;
 use super::keyspec::{self, Begin, Find, KeySpec};
 use super::table::{self, Spec};
 use super::{
@@ -271,6 +272,50 @@ const BOOLS: [&str; 2] = ["yes", "no"];
 const CLUSTER_COVERAGE: [&str; 2] = [
     "cluster-require-full-coverage",
     "cluster-allow-reads-when-down",
+];
+
+/// The four settings a slot migration runs under.
+///
+/// Each row is the name, which knob it writes, whether it reads a byte count or
+/// a plain number, the smallest value it takes, and whether it is hidden. They
+/// are here as a group rather than one at a time because they are only ever
+/// read together, by an operator working out why a move is taking as long as it
+/// is, and a group with a hole in it is worse than no group at all.
+///
+/// Hidden is Redis's word for a setting that a pattern does not find and an
+/// exact name does. It is what upstream does with the two of these that are
+/// backstops rather than things to tune, and copying it matters because a tool
+/// that dumps `CONFIG GET *` and writes the result back out as a config file
+/// would otherwise carry them along.
+const MIGRATION: [(&str, Migration, bool, i64, bool); 4] = [
+    (
+        "cluster-slot-migration-handoff-max-lag-bytes",
+        Migration::Lag,
+        true,
+        0,
+        false,
+    ),
+    (
+        "cluster-slot-migration-write-pause-timeout",
+        Migration::Pause,
+        false,
+        0,
+        false,
+    ),
+    (
+        "cluster-slot-migration-sync-buffer-drain-timeout",
+        Migration::Drain,
+        false,
+        0,
+        true,
+    ),
+    (
+        "cluster-slot-migration-max-archived-tasks",
+        Migration::Archived,
+        false,
+        1,
+        true,
+    ),
 ];
 
 /// Whether this server is a cluster node, which is fixed for the life of the
@@ -1155,6 +1200,48 @@ fn bad_setting(name: &str, parsed: bool) -> Error {
     }
 }
 
+/// Whether a `CONFIG GET` argument is a pattern rather than a name.
+///
+/// Upstream's test, character for character: it looks for any of `[*?` and
+/// takes the direct dictionary lookup when there are none. A name with none of
+/// them in it is a name even when it would have matched nothing, and a pattern
+/// with one of them in it is a pattern even when it would only have matched the
+/// one setting.
+fn is_pattern(asked: &[u8]) -> bool {
+    asked.iter().any(|b| matches!(b, b'[' | b'*' | b'?'))
+}
+
+/// Which spelling of a setting to answer under, or `None` when nothing asked
+/// for it.
+///
+/// A setting spelled out is answered under the spelling the client used, and a
+/// setting a pattern found is answered under its own name. That looks like a
+/// quirk and is really the shape of upstream's code: it collects the matches in
+/// a dictionary keyed by whatever it looked up with, which for the exact branch
+/// is the client's string and for the pattern branch is the table's. So
+/// `CONFIG GET MAXMEMORY` answers `MAXMEMORY` and `CONFIG GET MAX*` answers
+/// `maxmemory`, and a tool comparing the name it asked for with the name it got
+/// back only works if that is copied.
+///
+/// The first argument that matches wins, for the same reason: the dictionary
+/// already holds the setting by the time the second one is looked at, and a
+/// setting already in it is skipped.
+///
+/// `hidden` is upstream's flag for a setting a pattern does not find. Those are
+/// the backstops nobody is meant to tune, and leaving them out of `CONFIG GET *`
+/// keeps them out of anything that dumps the settings and writes them back.
+fn asked<'a>(args: Args<'a>, name: &'a str, hidden: bool) -> Option<&'a [u8]> {
+    (2..args.len()).find_map(|i| {
+        let want = args.get(i);
+        if is_pattern(want) {
+            (!hidden && glob::matches_nocase(want, name.as_bytes(), true))
+                .then_some(name.as_bytes())
+        } else {
+            is(want, name.as_bytes()).then_some(want)
+        }
+    })
+}
+
 /// `CONFIG GET|SET|RESETSTAT|REWRITE|HELP`.
 fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
     let sub = args.get(1);
@@ -1162,15 +1249,18 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         if args.len() < 3 {
             return Err(args::wrong_arity_sub("config", "get"));
         }
-        let wanted =
-            |name: &str| (2..args.len()).any(|i| glob::matches(args.get(i), name.as_bytes()));
+        // Every one of these is the name to answer under rather than a yes or a
+        // no, because a setting spelled out is answered under the client's
+        // spelling. See [`asked`] for why that is upstream's rule and not an
+        // accident of it.
+        let wanted = |name: &'static str| asked(args, name, false);
         // A setting that two patterns both ask for is sent once, which is what
         // makes this a count of settings rather than a count of matches. The
         // two spellings of a ladder setting are two settings by that rule, so
         // `CONFIG GET hash-max-*` sends the listpack name and the ziplist name
         // and the same number under both, which is what a real server does.
-        let fixed = SETTINGS.iter().filter(|(k, _)| wanted(k));
-        let ladder = LADDER.iter().filter(|(k, _)| wanted(k));
+        let fixed = SETTINGS.iter().filter_map(|(k, v)| Some((wanted(k)?, v)));
+        let ladder = LADDER.iter().filter_map(|(k, n)| Some((wanted(k)?, n)));
         let policy = wanted(MAXMEMORY_POLICY);
         let threads = wanted(IO_THREADS);
         let limit = wanted(MAXMEMORY);
@@ -1195,95 +1285,97 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let coverage = CLUSTER_COVERAGE.map(wanted);
         let clustered = wanted(CLUSTER_ENABLED);
         let nodes_file = wanted(CLUSTER_CONFIG_FILE);
+        let migration = MIGRATION.map(|(name, _, _, _, hidden)| asked(args, name, hidden));
         out.map(
             fixed.clone().count()
                 + ladder.clone().count()
-                + usize::from(policy)
-                + usize::from(threads)
-                + usize::from(limit)
-                + usize::from(store)
-                + usize::from(where_)
-                + usize::from(file)
-                + usize::from(pass)
-                + usize::from(ttl)
-                + usize::from(events)
-                + usize::from(acls)
-                + usize::from(logged)
-                + usize::from(channels)
-                + usize::from(readonly[0])
-                + usize::from(readonly[1])
-                + usize::from(mauth)
-                + usize::from(muser)
-                + usize::from(coverage[0])
-                + usize::from(coverage[1])
-                + usize::from(clustered)
-                + usize::from(nodes_file),
+                + usize::from(policy.is_some())
+                + usize::from(threads.is_some())
+                + usize::from(limit.is_some())
+                + usize::from(store.is_some())
+                + usize::from(where_.is_some())
+                + usize::from(file.is_some())
+                + usize::from(pass.is_some())
+                + usize::from(ttl.is_some())
+                + usize::from(events.is_some())
+                + usize::from(acls.is_some())
+                + usize::from(logged.is_some())
+                + usize::from(channels.is_some())
+                + usize::from(readonly[0].is_some())
+                + usize::from(readonly[1].is_some())
+                + usize::from(mauth.is_some())
+                + usize::from(muser.is_some())
+                + usize::from(coverage[0].is_some())
+                + usize::from(coverage[1].is_some())
+                + usize::from(clustered.is_some())
+                + usize::from(nodes_file.is_some())
+                + migration.iter().filter(|name| name.is_some()).count(),
         );
         for (k, v) in fixed {
-            out.bulk(k.as_bytes());
+            out.bulk(k);
             out.bulk(v.as_bytes());
         }
         for (k, knob) in ladder {
-            out.bulk(k.as_bytes());
+            out.bulk(k);
             out.bulk_int(read_knob(&server.settings(), *knob) as i64);
         }
-        if policy {
-            out.bulk(MAXMEMORY_POLICY.as_bytes());
+        if let Some(k) = policy {
+            out.bulk(k);
             out.bulk(server.settings().policy().name().as_bytes());
         }
-        if threads {
-            out.bulk(IO_THREADS.as_bytes());
+        if let Some(k) = threads {
+            out.bulk(k);
             out.bulk_int(server.io_threads() as i64);
         }
-        if limit {
+        if let Some(k) = limit {
             // Back as a plain number of bytes whatever the client typed to set
             // it, which is what a real server does: `CONFIG SET maxmemory 1gb`
             // reads back as 1073741824.
-            out.bulk(MAXMEMORY.as_bytes());
+            out.bulk(k);
             out.bulk_int(server.maxmemory() as i64);
         }
-        if store {
+        if let Some(k) = store {
             // Minus one for no limit, and a plain number of bytes otherwise.
             // Zero cannot mean no limit here the way it does for `maxmemory`,
             // because zero is the setting that says the file holds nothing.
-            out.bulk(MAXSTORE.as_bytes());
+            out.bulk(k);
             out.bulk_int(server.maxstore().map_or(-1, |n| n as i64));
         }
-        if where_ {
+        if let Some(k) = where_ {
             // Absolute, which is what a real server answers too: it resolves the
             // directory at startup and reports the resolved one, so a client can
             // tell where the files are without knowing where the process was
             // launched from.
-            out.bulk(DIR.as_bytes());
+            out.bulk(k);
             yo_alloc::allow(|| out.bulk(server.dir().to_string_lossy().as_bytes()));
         }
-        if file {
+        if let Some(k) = file {
             // The name on its own and not the path, which is how a real server
             // answers it too: the two settings are joined by whoever reads them.
-            out.bulk(DBFILENAME.as_bytes());
+            out.bulk(k);
             out.bulk(persist::FILE.as_bytes());
         }
-        if pass {
-            out.bulk(REQUIREPASS.as_bytes());
+        if let Some(k) = pass {
+            out.bulk(k);
             server.with_password(|p| out.bulk(p));
         }
-        if ttl {
-            out.bulk(SEALED_TTL.as_bytes());
+        if let Some(k) = ttl {
+            out.bulk(k);
             out.bulk_int(server.backup().ttl() as i64);
         }
-        if events {
+        if let Some(k) = events {
             // The flags and not the string that set them, which is what a real
             // server answers too and is why the parser has a formatter next to
             // it rather than the text being kept.
-            out.bulk(NOTIFY.as_bytes());
+            out.bulk(k);
             let (buf, len) = notify::format(server.notify_flags());
             out.bulk(&buf[..len]);
         }
-        if acls {
+        if let Some(k) = acls {
             // Exactly what the server was started with, which for nearly every
             // server is nothing at all. Not resolved to an absolute path the way
             // `dir` is, because a real server answers what it was given here.
-            out.bulk(ACLFILE.as_bytes());
+            out.bulk(k);
             yo_alloc::allow(|| {
                 out.bulk(
                     server
@@ -1294,44 +1386,53 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                 );
             });
         }
-        if logged {
-            out.bulk(ACLLOG_MAX_LEN.as_bytes());
+        if let Some(k) = logged {
+            out.bulk(k);
             out.bulk_int(server.acl_log().max_len() as i64);
         }
-        if channels {
-            out.bulk(ACL_PUBSUB_DEFAULT.as_bytes());
+        if let Some(k) = channels {
+            out.bulk(k);
             out.bulk(CHANNEL_DEFAULTS[usize::from(!server.users().open_channels())].as_bytes());
         }
-        for (name, asked) in REPLICA_READ_ONLY.iter().zip(readonly) {
-            if asked {
-                out.bulk(name.as_bytes());
+        for name in readonly.into_iter().flatten() {
+            {
+                out.bulk(name);
                 out.bulk(BOOLS[usize::from(!server.replica_read_only_setting())].as_bytes());
             }
         }
-        if coverage[0] {
-            out.bulk(CLUSTER_COVERAGE[0].as_bytes());
+        if let Some(k) = coverage[0] {
+            out.bulk(k);
             out.bulk(BOOLS[usize::from(!server.cluster_full_coverage())].as_bytes());
         }
-        if coverage[1] {
-            out.bulk(CLUSTER_COVERAGE[1].as_bytes());
+        if let Some(k) = coverage[1] {
+            out.bulk(k);
             out.bulk(BOOLS[usize::from(!server.cluster_reads_when_down())].as_bytes());
         }
-        if clustered {
-            out.bulk(CLUSTER_ENABLED.as_bytes());
+        if let Some(k) = clustered {
+            out.bulk(k);
             out.bulk(BOOLS[usize::from(!server.cluster_enabled())].as_bytes());
         }
-        if nodes_file {
-            out.bulk(CLUSTER_CONFIG_FILE.as_bytes());
+        if let Some(k) = nodes_file {
+            out.bulk(k);
             yo_alloc::allow(|| out.bulk(server.cluster_file().as_bytes()));
         }
-        if mauth || muser {
+        // Always a plain number of bytes or milliseconds, whatever the client
+        // typed to set it, the same way `maxmemory` reads back: `CONFIG SET
+        // cluster-slot-migration-handoff-max-lag-bytes 2mb` answers 2097152.
+        for ((_, knob, ..), name) in MIGRATION.iter().zip(migration) {
+            if let Some(name) = name {
+                out.bulk(name);
+                out.bulk_int(server.migration_knob(*knob));
+            }
+        }
+        if mauth.is_some() || muser.is_some() {
             server.with_master_auth(|user, pass| {
-                if mauth {
-                    out.bulk(MASTERAUTH.as_bytes());
+                if let Some(k) = mauth {
+                    out.bulk(k);
                     out.bulk(pass);
                 }
-                if muser {
-                    out.bulk(MASTERUSER.as_bytes());
+                if let Some(k) = muser {
+                    out.bulk(k);
                     out.bulk(user);
                 }
             });
@@ -1366,6 +1467,7 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let mut coverage: [Option<bool>; 2] = [None, None];
         let mut mauth = None;
         let mut muser = None;
+        let mut migration: [Option<i64>; MIGRATION.len()] = [None; MIGRATION.len()];
         let mut i = 2;
         while i < args.len() {
             let (name, value) = (args.get(i), args.get(i + 1));
@@ -1513,6 +1615,52 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                     )
                 }));
             }
+            if let Some((at, (k, knob, memory, least, _))) = MIGRATION
+                .iter()
+                .enumerate()
+                .find(|(_, (k, ..))| is(name, k.as_bytes()))
+            {
+                // The one that counts bytes takes a unit and the three that
+                // count something else do not, which is upstream's split
+                // between a memory config and an integer one and is why
+                // `write-pause-timeout 10s` is refused while
+                // `handoff-max-lag-bytes 10mb` is taken.
+                let parsed = if *memory {
+                    parse_memory(value).map(|n| n as i64).filter(|n| *n >= 0)
+                } else {
+                    parse_i64(value)
+                };
+                let Some(n) = parsed else {
+                    if *memory {
+                        return Err(Error::fmt(
+                            Code::Invalid,
+                            format_args!(
+                                "CONFIG SET failed (possibly related to argument '{k}') - argument must be a memory value"
+                            ),
+                        ));
+                    }
+                    return Err(bad_setting(k, false));
+                };
+                // The archived count is the only one with a ceiling, because it
+                // is an `int` upstream and the other three are a `long long`.
+                // The sentence names the pair it was given rather than the pair
+                // it happens to have, which is what a real server answers.
+                let most = if *knob == Migration::Archived {
+                    i64::from(i32::MAX)
+                } else {
+                    i64::MAX
+                };
+                if n < *least || n > most {
+                    return Err(Error::fmt(
+                        Code::Invalid,
+                        format_args!(
+                            "CONFIG SET failed (possibly related to argument '{k}') - argument must be between {least} and {most} inclusive"
+                        ),
+                    ));
+                }
+                migration[at] = Some(n);
+                continue;
+            }
             if is(name, MASTERAUTH.as_bytes()) {
                 // Anything at all, including nothing, which is how the password
                 // is taken off again. It is read at the next dial rather than
@@ -1642,6 +1790,14 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         }
         if let Some(yes) = readonly {
             server.set_replica_read_only(yes);
+        }
+        // One at a time and in the order they were written down, because none
+        // of the four is read together with any of the others and there is
+        // nothing here that a half applied pair would break.
+        for ((_, knob, ..), value) in MIGRATION.iter().zip(migration) {
+            if let Some(n) = value {
+                server.set_migration_knob(*knob, n);
+            }
         }
         // One write of the pair whichever of the two was named, for the same
         // reason the master credentials are written together: they are read as a

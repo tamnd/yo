@@ -53,8 +53,8 @@
 //! stop writes while reading it, and the shorter that is the better.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 
 use yo_common::lock::Lock;
 use yo_common::{Code, Error, Result};
@@ -73,23 +73,101 @@ use super::{ID_LEN, key_slot};
 
 /// How many finished tasks are kept to be asked about afterwards.
 ///
-/// The reference's `cluster-slot-migration-max-archived-tasks`, which is hidden
-/// and defaults to this. A finished task is a few hundred bytes and the only
-/// thing that reads one is an operator asking what happened, so the number only
-/// has to be larger than the number of moves anybody looks back over.
-const MAX_ARCHIVED: usize = 32;
+/// The default of `cluster-slot-migration-max-archived-tasks`. A finished task
+/// is a few hundred bytes and the only thing that reads one is an operator
+/// asking what happened, so the number only has to be larger than the number of
+/// moves anybody looks back over.
+const MAX_ARCHIVED: i64 = 32;
 
 /// How far behind the far side may be and still be called caught up.
 ///
-/// The reference's `cluster-slot-migration-handoff-max-lag-bytes`, which
-/// defaults to this. Waiting for nought would mean waiting for a moment that a
-/// busy server never has, so the rule is instead that the far side is close
-/// enough that it can finish inside the pause rather than before it. A megabyte
-/// of commands is a few milliseconds of applying them.
+/// The default of `cluster-slot-migration-handoff-max-lag-bytes`. Waiting for
+/// nought would mean waiting for a moment that a busy server never has, so the
+/// rule is instead that the far side is close enough that it can finish inside
+/// the pause rather than before it. A megabyte of commands is a few
+/// milliseconds of applying them.
+const MAX_LAG: i64 = 1024 * 1024;
+
+/// How long writes may stay paused waiting for the far side to take the slots.
 ///
-/// A constant rather than a config row, because the whole group of migration
-/// settings belongs in the table in one go, which is part of D-149.
-const MAX_LAG: u64 = 1024 * 1024;
+/// The default of `cluster-slot-migration-write-pause-timeout`, in
+/// milliseconds. Once the pause is on, every client writing to this node is
+/// waiting on one node on the other end of one connection, so the pause needs a
+/// bound that is short enough to be survivable and long enough that a far side
+/// which is merely busy is not given up on. Ten seconds is the reference's
+/// answer to that.
+const WRITE_PAUSE: i64 = 10 * 1000;
+
+/// How long the far side gets to drain what it has buffered.
+///
+/// The default of `cluster-slot-migration-sync-buffer-drain-timeout`, in
+/// milliseconds, and the reference doubles it when the snapshot itself took
+/// longer than that to apply. Hidden, because it is a backstop rather than
+/// something to tune.
+const DRAIN: i64 = 60 * 1000;
+
+/// The `cluster-slot-migration-*` settings.
+///
+/// Atomics and not a lock, because two of them are read on the path every
+/// propagated write takes and the other two are read by the cron. Nothing here
+/// is read together with anything else here, so there is no pair to keep
+/// consistent and no reason for them to share one word.
+///
+/// All four are held even when this node is not a cluster node at all, which is
+/// the reference's rule as well: `CONFIG GET` answers them on any server, and a
+/// tool reading a setting before deciding what to do wants the number rather
+/// than nothing back.
+struct Knobs {
+    /// `cluster-slot-migration-handoff-max-lag-bytes`.
+    lag: AtomicI64,
+    /// `cluster-slot-migration-write-pause-timeout`, in milliseconds.
+    pause: AtomicI64,
+    /// `cluster-slot-migration-sync-buffer-drain-timeout`, in milliseconds.
+    drain: AtomicI64,
+    /// `cluster-slot-migration-max-archived-tasks`.
+    archived: AtomicI64,
+}
+
+impl Default for Knobs {
+    fn default() -> Self {
+        Self {
+            lag: AtomicI64::new(MAX_LAG),
+            pause: AtomicI64::new(WRITE_PAUSE),
+            drain: AtomicI64::new(DRAIN),
+            archived: AtomicI64::new(MAX_ARCHIVED),
+        }
+    }
+}
+
+impl Knobs {
+    /// The one word a name stands for.
+    fn of(&self, which: Migration) -> &AtomicI64 {
+        match which {
+            Migration::Lag => &self.lag,
+            Migration::Pause => &self.pause,
+            Migration::Drain => &self.drain,
+            Migration::Archived => &self.archived,
+        }
+    }
+}
+
+/// Which of the four migration settings is being read or written.
+///
+/// A name rather than a string, so that the config table and the code that
+/// wants the number cannot drift apart: adding a row here without giving it a
+/// word to answer to does not compile.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Migration {
+    /// How far behind the far side may be and still be called caught up, in
+    /// bytes. Read on every acknowledgement.
+    Lag,
+    /// How long writes may stay paused, in milliseconds.
+    Pause,
+    /// How long the far side gets to drain its buffer, in milliseconds.
+    Drain,
+    /// How many finished tasks are kept.
+    Archived,
+}
 
 /// Where a task has got to.
 ///
@@ -284,6 +362,9 @@ impl Task {
 #[derive(Default)]
 pub(super) struct Asm {
     inner: Lock<Tasks>,
+    /// The `cluster-slot-migration-*` settings, which `CONFIG SET` writes and
+    /// everything in here reads.
+    knobs: Knobs,
     /// Whether there is a migration sending changes right now.
     ///
     /// Outside the lock because it is read once for every write the server
@@ -303,13 +384,13 @@ struct Tasks {
 impl Tasks {
     /// Move the live task onto the finished list, which is the reference's
     /// `asmTaskFinalize`.
-    fn finish(&mut self, now: i64) {
+    fn finish(&mut self, now: i64, keep: usize) {
         let Some(mut task) = self.live.take() else {
             return;
         };
         task.ended = now;
         self.done.insert(0, task);
-        self.done.truncate(MAX_ARCHIVED);
+        self.done.truncate(keep);
     }
 }
 
@@ -365,7 +446,7 @@ impl Asm {
     /// and the task agree: a task that is no longer live cannot be one that is
     /// still being fed.
     fn retire(&self, tasks: &mut Tasks, now: i64) {
-        tasks.finish(now);
+        tasks.finish(now, self.knobs.archived.load(Relaxed).max(1) as usize);
         self.streaming.store(false, Relaxed);
     }
 
@@ -425,9 +506,10 @@ impl Asm {
     /// way on a connection whose other direction is the change stream, and a
     /// reply on it would be read as a command.
     ///
-    /// Once the far side is within [`MAX_LAG`] of everything that has been sent,
-    /// the task moves to `handoff-prep`, which is the point at which writes
-    /// would stop. Stopping them is D-149, so for now it says so and waits.
+    /// Once the far side is within `cluster-slot-migration-handoff-max-lag-bytes`
+    /// of everything that has been sent, the task moves to `handoff-prep`, which
+    /// is the point at which writes would stop. Stopping them is D-149, so for
+    /// now it says so and waits.
     fn ack(&self, conn: u64, state: State, offset: u64) {
         let mut tasks = self.inner.lock();
         let Some(task) = tasks.live.as_mut() else {
@@ -445,7 +527,8 @@ impl Asm {
             return;
         }
         task.acked = offset;
-        if task.state == State::SendStream && task.acked + MAX_LAG >= task.sent {
+        let lag = self.knobs.lag.load(Relaxed).max(0) as u64;
+        if task.state == State::SendStream && task.acked + lag >= task.sent {
             task.state = State::HandoffPrep;
         }
     }
@@ -683,6 +766,22 @@ impl Server {
         }
     }
 
+    /// Read one of the `cluster-slot-migration-*` settings.
+    pub(crate) fn migration_knob(&self, which: Migration) -> i64 {
+        self.cluster.asm.knobs.of(which).load(Relaxed)
+    }
+
+    /// Write one of the `cluster-slot-migration-*` settings.
+    ///
+    /// It takes effect on the next thing that reads it, which for the lag bound
+    /// is the next acknowledgement and for the two timeouts is the next tick of
+    /// the cron. A migration already running is not restarted and does not need
+    /// to be: none of these is remembered anywhere, they are all read fresh
+    /// every time they are wanted.
+    pub(crate) fn set_migration_knob(&self, which: Migration, value: i64) {
+        self.cluster.asm.knobs.of(which).store(value, Relaxed);
+    }
+
     /// The body of [`Server::asm_snapshot`], with nothing writing behind it.
     fn write_snapshot(&self, slots: &[(u16, u16)], out: &mut Out) {
         // Every library on the server, whether or not anything is using one. The
@@ -814,9 +913,15 @@ mod tests {
 
     use super::super::super::Server;
     use super::super::super::clients::Client;
-    use super::{MAX_LAG, State, key_slot};
+    use super::{State, key_slot};
     use crate::proto::Proto;
     use crate::reply::Out;
+
+    /// The default lag bound as an offset, which is what these count in.
+    const LAG: u64 = super::MAX_LAG as u64;
+
+    /// The default number of finished tasks kept.
+    const KEEP: usize = super::MAX_ARCHIVED as usize;
 
     /// A server in cluster mode holding every slot, which is what the far side
     /// of a migration talks to.
@@ -1054,31 +1159,31 @@ mod tests {
         server.asm_snapshot(&[(0, 16383)]);
         {
             let mut tasks = server.cluster.asm.inner.lock();
-            tasks.live.as_mut().unwrap().sent = MAX_LAG * 4;
+            tasks.live.as_mut().unwrap().sent = LAG * 4;
         }
         // A word that is not one the far side is allowed to send changes
         // nothing, and neither does an acknowledgement on another connection.
-        server.asm_ack(7, b"takeover", MAX_LAG * 4);
-        server.asm_ack(9, b"streaming-buffer", MAX_LAG * 4);
+        server.asm_ack(7, b"takeover", LAG * 4);
+        server.asm_ack(9, b"streaming-buffer", LAG * 4);
         // Still a long way behind.
-        server.asm_ack(7, b"streaming-buffer", MAX_LAG);
+        server.asm_ack(7, b"streaming-buffer", LAG);
         let state = |server: &Server| server.cluster.asm.inner.lock().live.as_ref().unwrap().state;
         assert_eq!(state(&server), State::SendStream);
         // Going backwards is stale rather than wrong, and is dropped.
         server.asm_ack(7, b"streaming-buffer", 0);
         assert_eq!(
             server.cluster.asm.inner.lock().live.as_ref().unwrap().acked,
-            MAX_LAG
+            LAG
         );
         // And within a megabyte is close enough.
-        server.asm_ack(7, b"wait-stream-eof", MAX_LAG * 3);
+        server.asm_ack(7, b"wait-stream-eof", LAG * 3);
         assert_eq!(state(&server), State::HandoffPrep);
         // Which is still a state that takes the changes still arriving.
         let write = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$1\r\nx\r\n";
         server.asm_feed(write);
         assert_eq!(
             server.cluster.asm.inner.lock().live.as_ref().unwrap().sent,
-            MAX_LAG * 4 + write.len() as u64
+            LAG * 4 + write.len() as u64
         );
     }
 
@@ -1190,7 +1295,7 @@ mod tests {
     #[test]
     fn the_finished_list_is_bounded() {
         let server = node();
-        for i in 0..(super::MAX_ARCHIVED + 5) {
+        for i in 0..(KEEP + 5) {
             let id = format!("{i:040}");
             server
                 .asm_begin_migrate(id.as_bytes(), &[b'c'; 40], vec![(0, 100)], &wire(7))
@@ -1200,12 +1305,9 @@ mod tests {
         let mut out = Out::new(Proto::Resp3);
         server.cluster.asm.report_all(&mut out);
         let got = text(&out);
-        assert!(
-            got.starts_with(&format!("*{}\r\n", super::MAX_ARCHIVED)),
-            "{got:?}"
-        );
+        assert!(got.starts_with(&format!("*{KEEP}\r\n")), "{got:?}");
         // Newest first, which is the order the reference keeps them in.
-        let newest = format!("{:040}", super::MAX_ARCHIVED + 4);
+        let newest = format!("{:040}", KEEP + 4);
         assert!(got.contains(&newest), "{got:?}");
     }
 }
