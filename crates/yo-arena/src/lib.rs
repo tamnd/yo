@@ -1,16 +1,58 @@
 //! The arena: 2 MiB segments, a bump pointer, and dead byte accounting.
 //!
 //! This is the whole value allocator for a shard (`05` section 3). There is no
-//! free list, no size class and no header per allocation. Allocation is an add
-//! and a compare. Deallocation does not exist, it just increments a counter on
-//! the owning segment, and space comes back through compaction rather than
-//! through free.
+//! header on a live allocation and no lock anywhere, and an allocation that
+//! nobody has freed room for is an add and a compare.
 //!
-//! L11 is the reason. aki's `*STORE` family ran at 0.30 to 0.55x because its
-//! arena was grow only, so `SINTERSTORE` into an existing key leaked the old
-//! result every time. The fix is reclaim, not malloc: a general allocator would
-//! also fix the leak and would cost 20 to 60 ns per allocation with a size class
-//! lookup and a possible lock, against the roughly 1 ns this costs.
+//! L11 is the reason there is reclaim at all. aki's `*STORE` family ran at 0.30
+//! to 0.55x because its arena was grow only, so `SINTERSTORE` into an existing
+//! key leaked the old result every time.
+//!
+//! # Where the space comes back from
+//!
+//! Two ways, and which one runs is most of what a write costs.
+//!
+//! A freed run goes on a list of runs of exactly its size, and the next request
+//! for that size takes it back. No copying, no index write, nothing left for a
+//! collector to do. A store that overwrites its keys lives on this, and it is
+//! the cheaper of the two by a wide margin.
+//!
+//! Compaction is the other one, and it is for what the lists cannot fix: space
+//! sitting in sizes nobody is asking for. It empties a segment by copying every
+//! live record out of it, which at a dead fraction `d` costs `(1 - d) / d`
+//! bytes moved per byte reclaimed, so three moved per byte at the quarter
+//! [`Arena::COMPACT_RATIO`] starts from. That is the price of a byte the lists
+//! could not hand back, and it is the whole argument for having them.
+//!
+//! The lists are what tamnd/yo#518 was. The cache benchmark draws its value
+//! lengths from 1 to 1024, so nearly every overwrite it sends replaces a record
+//! with one of a different length, which cannot be written where it lies.
+//! Without the lists each of those left a hole only a collector could fill, and
+//! the collector copied nine gigabytes to keep up with three gigabytes of
+//! writes. SET throughput sat at 130 thousand a second against 900 thousand for
+//! the best rival on the same box, flat in the thread count and flat in the
+//! pipeline depth, because the rate was the rate the collector could copy at.
+//!
+//! # What the lists are made of
+//!
+//! The links live in the freed run, because there is nowhere else to put them
+//! that does not allocate. A vector per size class is the obvious shape and it
+//! grows, and growing is a call to the system allocator on a command path,
+//! which is the one thing Y7 forbids.
+//!
+//! So a run on a list holds a tag, its own length and two neighbours, in the
+//! bytes that were the record. That is 24 bytes, which is why runs smaller than
+//! [`MIN_LISTED`] stay off the lists and wait for compaction like they used to.
+//! The tag is [`u32::MAX`], which the length prefix of a real record cannot be,
+//! so anything walking a segment can tell one from the other. That is not free:
+//! it is a shape this crate is imposing on the first four bytes of what a
+//! caller stores, and it is written down on [`Arena::listed_at`].
+//!
+//! Doubly linked rather than singly, for one reason. A segment that compaction
+//! empties gives its pages back, and a link into it would then be a link into
+//! whatever gets bumped through it next. Every run in a segment about to be
+//! reclaimed has to come off its list first, and coming off in constant time is
+//! what the back link buys. [`Arena::reclaim`] checks that it happened.
 //!
 //! # Ownership
 //!
@@ -48,10 +90,81 @@ pub const ALIGN: usize = 16;
 /// [`Arena::alloc`] returns `None` rather than growing a segment to fit.
 pub const MAX_ALLOC: usize = SEGMENT_SIZE - HEADER_SIZE;
 
+/// The largest run [`Arena::free`] keeps for reuse.
+///
+/// Every size from [`MIN_LISTED`] to here gets a list of its own, so reuse is
+/// exact fit: a run handed back is handed out whole, nothing is split and
+/// nothing is merged. That is what keeps a free a push and an allocation a pop,
+/// and it is only affordable because the classes are 16 bytes apart rather than
+/// a doubling apart, so an exact fit is nearly always there.
+///
+/// Two kilobytes holds a kilobyte value with a long key and a header on it,
+/// which is the top of what the cache benchmark asks for with room over it.
+/// Past this a run goes back to being a dead byte counter and compaction
+/// collects it. The reason for a ceiling at all is that the heads are an array
+/// in every arena, so every class costs eight bytes of every stripe of every
+/// database whether anything ever frees one or not.
+pub const REUSE_MAX: usize = 2048;
+
+/// The smallest run that can go on a list, which is the smallest one with room
+/// for the links.
+///
+/// A run under this is a very short key with a very short value, and the space
+/// it gives back is not worth a second layout for. It stays a dead byte and
+/// compaction gets it.
+pub const MIN_LISTED: usize = 32;
+
+/// How many size classes that comes to. A run of `size` bytes is on class
+/// `size / ALIGN - 1`, so the last class is [`REUSE_MAX`] and the first is 16
+/// bytes and is never used, because nothing under [`MIN_LISTED`] is listed. One
+/// wasted head is cheaper than shifting the whole range to close the gap.
+const CLASSES: usize = REUSE_MAX / ALIGN;
+
+/// The end of a list, and the value of a head with nothing on it.
+///
+/// Not zero, because zero is an arena offset: it names the first byte of
+/// segment zero, which is inside that segment's header, so it is not a run
+/// either. It is still the kind of value that turns a missing initialiser into
+/// a plausible looking address, and this one cannot.
+const NONE: u64 = u64::MAX;
+
 const _: () = {
     assert!(SEGMENT_SIZE == 1 << SEGMENT_SHIFT);
     assert!(HEADER_SIZE.is_multiple_of(ALIGN));
+    assert!(REUSE_MAX.is_multiple_of(ALIGN));
+    assert!(REUSE_MAX <= MAX_ALLOC);
+    assert!(MIN_LISTED.is_multiple_of(ALIGN));
+    assert!(MIN_LISTED <= REUSE_MAX);
+    assert!(size_of::<Listed>() <= MIN_LISTED);
+    assert!(align_of::<Listed>() <= ALIGN);
 };
+
+/// What a run holds while it waits on a size class list.
+///
+/// Written over the record that used to be there, which is why this is
+/// `repr(C)` and why `tag` is first: the four bytes it lands on are the four a
+/// record's length prefix lands on, and telling the two apart is a comparison
+/// against one impossible value rather than a lookup somewhere else.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Listed {
+    /// [`u32::MAX`], which no record's first four bytes can be.
+    tag: u32,
+    /// How many bytes this run takes, which is what a walk steps by.
+    span: u32,
+    /// The run before this one on the same list, or [`NONE`] if this is the
+    /// head.
+    prev: u64,
+    /// The run after it, or [`NONE`] if this is the last.
+    next: u64,
+}
+
+/// The value of [`Listed::tag`].
+///
+/// A record's first four bytes are the length of its key, which cannot reach
+/// [`MAX_ALLOC`], let alone this. A segment whose pages have been handed back
+/// reads as zeroes, which is not this either.
+const LISTED_TAG: u32 = u32::MAX;
 
 /// The in memory and on disk header at offset 0 of every segment.
 ///
@@ -83,6 +196,14 @@ struct Segment {
     /// read out of it before it is written. The kernel refills on the first
     /// touch and what it refills with is not what was there.
     free: bool,
+    /// How many runs in this segment are on a size class list.
+    ///
+    /// Only [`Arena::reclaim`] reads it, and only to check that the caller
+    /// walked the segment and took its runs off their lists before handing the
+    /// pages back. Getting that wrong leaves a list pointing into a segment
+    /// that is about to be somebody else's, which is the one way this design
+    /// hands out the same bytes twice, so it is worth a counter to be sure.
+    listed: u32,
 }
 
 impl Segment {
@@ -133,7 +254,19 @@ impl Segment {
             }
         }
 
-        Segment { base, free: false }
+        Segment {
+            base,
+            free: false,
+            listed: 0,
+        }
+    }
+
+    /// A pointer to `within` bytes into this segment.
+    #[inline]
+    fn at(&self, within: usize) -> *mut u8 {
+        debug_assert!(within < SEGMENT_SIZE);
+        // SAFETY: `within` is inside the `SEGMENT_SIZE` allocation.
+        unsafe { self.base.as_ptr().add(within) }
     }
 
     /// Hand the pages back to the kernel, keeping the mapping.
@@ -247,8 +380,22 @@ pub struct Arena {
     /// it is dead: the index holds the new address of everything that moved,
     /// and nothing else can name arena bytes.
     free_segs: Vec<usize>,
+    /// The first run waiting on each size class list, or [`NONE`].
+    ///
+    /// An array and not a vector of vectors, because a vector grows and growing
+    /// is an allocation on a command path. A kilobyte per arena, paid by every
+    /// stripe of every database including the fifteen that stay empty, and
+    /// that is what the ceiling on [`REUSE_MAX`] is buying down.
+    heads: [u64; CLASSES],
     /// Dead bytes across every segment, so that deciding whether compaction is
     /// worth doing is one comparison rather than a walk over the headers.
+    ///
+    /// A run on a size class list is dead by this count, because it is not
+    /// keeping anything. That is what makes the two collectors agree with each
+    /// other: a store whose lists are handing runs straight back sits far under
+    /// [`Arena::GARBAGE_RATIO`] and compaction never starts, and a store whose
+    /// freed space is piling up in sizes nobody is asking for crosses it, which
+    /// is exactly the space compaction is for.
     dead_total: u64,
 }
 
@@ -282,6 +429,7 @@ impl Arena {
             cur_start: core::ptr::null_mut(),
             allocated: 0,
             free_segs: Vec::new(),
+            heads: [NONE; CLASSES],
             dead_total: 0,
         }
     }
@@ -336,6 +484,14 @@ impl Arena {
     /// caller should be using the log region instead. Running out of segments
     /// is not a `None`, it allocates another one.
     ///
+    /// A run of exactly this size that somebody freed comes back before the
+    /// bump pointer moves. That is a pop against an add, which is the more
+    /// expensive of the two written down and the cheaper one everywhere it
+    /// matters: the bytes it hands back are bytes this store wrote recently and
+    /// still has in cache, where a bump hands back a page the kernel has to
+    /// clear first, and a run reused is a run compaction never has to copy its
+    /// neighbours away from.
+    ///
     /// The live cursor is `cur_ptr`, not the segment header's `bump`. The
     /// header sits on a different cache line from the bytes being handed out,
     /// so updating it on every allocation would touch two lines instead of one
@@ -348,7 +504,104 @@ impl Arena {
         if size > MAX_ALLOC {
             return None;
         }
+        // One load off an array that is in cache and a branch that predicts,
+        // on a store that has never freed anything and every store still
+        // filling up for the first time.
+        //
+        // In two steps, the claim and then the view, because a borrow checker
+        // cannot see that two calls returning a borrow of the same arena are
+        // never both taken.
+        if (MIN_LISTED..=REUSE_MAX).contains(&size) && self.heads[size / ALIGN - 1] != NONE {
+            let off = self.take(size);
+            return Some(self.view(off, len));
+        }
+        self.bump(len, size)
+    }
 
+    /// Take the head off the list for `size` and account for it being live
+    /// again.
+    ///
+    /// The caller has checked that the list is not empty, which is the same
+    /// load this needs and one the caller was going to do anyway.
+    fn take(&mut self, size: usize) -> u64 {
+        let class = size / ALIGN - 1;
+        let off = self.heads[class];
+        debug_assert_ne!(off, NONE, "took from an empty size class");
+        let node = self.listed(off);
+        debug_assert_eq!(node.tag, LISTED_TAG, "a size class list left its runs");
+        debug_assert_eq!(node.span as usize, size, "a run is on the wrong list");
+        debug_assert_eq!(
+            node.prev, NONE,
+            "the head of a list has something before it"
+        );
+        self.heads[class] = node.next;
+        if node.next != NONE {
+            let mut after = self.listed(node.next);
+            after.prev = NONE;
+            self.write_listed(node.next, after);
+        }
+
+        let seg = (off >> SEGMENT_SHIFT) as usize;
+        self.segs[seg].listed -= 1;
+        // These bytes are keeping something again, so the segment holding them
+        // is that much less worth compacting. Without this a store that reuses
+        // its runs would raise its own dead byte count on every write and send
+        // a collector after space that has already come back.
+        let h = self.segs[seg].header_mut();
+        let was = h.dead_bytes;
+        let now = was.saturating_sub(size as u64);
+        h.dead_bytes = now;
+        self.dead_total -= was - now;
+        self.allocated += size as u64;
+        off
+    }
+
+    /// The address and the writable view of a run [`Arena::take`] just claimed.
+    fn view(&mut self, off: u64, len: usize) -> (Addr, &mut [u8]) {
+        let seg = (off >> SEGMENT_SHIFT) as usize;
+        let within = (off & (SEGMENT_SIZE as u64 - 1)) as usize;
+        debug_assert!(within >= HEADER_SIZE && within + len <= SEGMENT_SIZE);
+        let p = self.segs[seg].at(within);
+        // SAFETY: `len` is no more than the size the run was listed under, so
+        // the whole of it is inside the segment. The run has been off every
+        // list since `take` unlinked it and nothing live points at it, because
+        // it only got on a list by being freed.
+        let bytes = unsafe { core::slice::from_raw_parts_mut(p, len) };
+        // SAFETY: the offset came out of a listed run and has not changed.
+        let addr = unsafe { Addr::new_unchecked(Space::Arena, off) };
+        (addr, bytes)
+    }
+
+    /// Read the links out of the run at `off`.
+    #[inline]
+    fn listed(&self, off: u64) -> Listed {
+        let addr = {
+            // SAFETY: every offset on a list came from an `Addr`.
+            unsafe { Addr::new_unchecked(Space::Arena, off) }
+        };
+        let p = self.resolve(addr, size_of::<Listed>());
+        // SAFETY: `resolve` checked the run is inside its segment, and a run is
+        // aligned to `ALIGN`, which `Listed` needs no more than.
+        unsafe { p.cast::<Listed>().read() }
+    }
+
+    /// Write the links into the run at `off`.
+    #[inline]
+    fn write_listed(&mut self, off: u64, node: Listed) {
+        let addr = {
+            // SAFETY: as `listed`.
+            unsafe { Addr::new_unchecked(Space::Arena, off) }
+        };
+        let p = self.resolve(addr, size_of::<Listed>());
+        // SAFETY: as `listed`, and the run is not live, so nothing else holds a
+        // view of these bytes.
+        unsafe { p.cast::<Listed>().write(node) }
+    }
+
+    /// Move the bump pointer, which is where a run comes from when no list has
+    /// one to hand back.
+    #[inline]
+    fn bump(&mut self, len: usize, size: usize) -> Option<(Addr, &mut [u8])> {
         let p = self.cur_ptr;
         // Compare addresses rather than pointers. The obvious form is
         // `p.add(size) > self.cur_end`, and it is undefined behaviour: forming
@@ -423,13 +676,22 @@ impl Arena {
     /// heap allocation per record on a thread that is not allowed one. This
     /// goes arena to arena with one `memcpy` and no allocator call.
     ///
+    /// Takes from the bump pointer and never from a size class list, which is
+    /// the one place in the arena that has to. Compaction copies a record out
+    /// of a segment it is trying to empty, and a list holds runs from every
+    /// segment there is, including that one. A destination inside the source
+    /// would leave a live record in a segment about to be reclaimed, so the
+    /// record has to land somewhere the arena is currently filling.
+    ///
     /// # Panics
     ///
     /// As [`Arena::get`], and if `len` is over [`MAX_ALLOC`].
     pub fn copy_within(&mut self, src: Addr, len: usize) -> Addr {
         let from = self.resolve(src, len);
+        let size = Self::slot(len);
+        assert!(size <= MAX_ALLOC, "a run of {len} bytes is too big to copy");
         let (addr, out) = self
-            .alloc(len)
+            .bump(len, size)
             .expect("a run already in the arena fits in the arena");
         // SAFETY: `from` is a `len` byte run inside a segment, `out` is a fresh
         // `len` byte allocation, and a fresh allocation cannot overlap a run
@@ -485,9 +747,19 @@ impl Arena {
 
     /// Record that `len` bytes at `addr` are no longer live.
     ///
-    /// Does not reuse the space. It raises the owning segment's dead byte
-    /// counter, which is what makes the segment a compaction candidate once it
-    /// passes [`Arena::COMPACT_RATIO`].
+    /// Raises the owning segment's dead byte counter, which is what makes the
+    /// segment a compaction candidate once it passes
+    /// [`Arena::COMPACT_RATIO`], and puts the run on the list for its size
+    /// class if it has one, which is what lets the next allocation of that size
+    /// have it back without anything being copied.
+    ///
+    /// A listed run still counts as dead, and that is what keeps the two
+    /// collectors from fighting. A store overwriting values of one length hands
+    /// each freed run straight back out again, so its dead byte count returns
+    /// to where it was and compaction never starts on it. A store whose freed
+    /// space is piling up in sizes nothing is asking for keeps that count
+    /// climbing, crosses the ratio, and gets compacted, which is the only thing
+    /// that can put those bytes back together.
     #[inline]
     pub fn free(&mut self, addr: Addr, len: usize) {
         assert_eq!(
@@ -496,15 +768,143 @@ impl Arena {
             "address does not point into the arena"
         );
         let size = Self::slot(len);
-        let seg = (addr.offset() >> SEGMENT_SHIFT) as usize;
-        let s = &mut self.segs[seg];
-        let h = s.header_mut();
+        let off = addr.offset();
+        let seg = (off >> SEGMENT_SHIFT) as usize;
+        let h = self.segs[seg].header_mut();
         let was = h.dead_bytes;
         h.dead_bytes = (h.dead_bytes + size as u64).min(SEGMENT_SIZE as u64);
         // The running total takes what the segment actually took, not what was
         // asked for, so that the clamp above cannot drift the two apart.
         self.dead_total += h.dead_bytes - was;
         self.allocated = self.allocated.saturating_sub(size as u64);
+
+        if (MIN_LISTED..=REUSE_MAX).contains(&size) {
+            self.list(off, size);
+        }
+    }
+
+    /// Free `len` bytes at `addr` without offering the space back.
+    ///
+    /// For a run in a segment that is being emptied. Compaction frees each
+    /// record as it moves it out, and those runs must not go on a list: the
+    /// segment is about to be reclaimed and bumped through again from the top,
+    /// so anything handed out of it in the meantime would be written over. The
+    /// bytes come back in one lump when the segment does, which is the whole
+    /// point of moving the records in the first place.
+    #[inline]
+    pub fn discard(&mut self, addr: Addr, len: usize) {
+        assert_eq!(
+            addr.space(),
+            Some(Space::Arena),
+            "address does not point into the arena"
+        );
+        let size = Self::slot(len);
+        let seg = (addr.offset() >> SEGMENT_SHIFT) as usize;
+        let h = self.segs[seg].header_mut();
+        let was = h.dead_bytes;
+        h.dead_bytes = (h.dead_bytes + size as u64).min(SEGMENT_SIZE as u64);
+        self.dead_total += h.dead_bytes - was;
+        self.allocated = self.allocated.saturating_sub(size as u64);
+    }
+
+    /// Push a freed run onto the head of the list for its size.
+    ///
+    /// The head and not the tail, because the run just freed is the run whose
+    /// bytes are still in cache.
+    fn list(&mut self, off: u64, size: usize) {
+        let class = size / ALIGN - 1;
+        let head = self.heads[class];
+        self.write_listed(
+            off,
+            Listed {
+                tag: LISTED_TAG,
+                span: size as u32,
+                prev: NONE,
+                next: head,
+            },
+        );
+        if head != NONE {
+            let mut was = self.listed(head);
+            was.prev = off;
+            self.write_listed(head, was);
+        }
+        self.heads[class] = off;
+        self.segs[(off >> SEGMENT_SHIFT) as usize].listed += 1;
+    }
+
+    /// The size a run at `addr` is listed under, if it is on a list at all.
+    ///
+    /// How a caller walking a segment tells a freed run from a live one, and it
+    /// has to be asked first, before anything reads the run as a record. A
+    /// listed run has the links written over the front of it, so the length
+    /// field a walker would otherwise step by is gone.
+    ///
+    /// The tag can be trusted where a magic number usually cannot. The first
+    /// four bytes of a live record are its key length, a key is at most
+    /// [`MAX_ALLOC`] bytes, and [`LISTED_TAG`] is `u32::MAX`, so no live record
+    /// can read as listed.
+    #[inline]
+    pub fn listed_at(&self, addr: Addr) -> Option<usize> {
+        let within = (addr.offset() & (SEGMENT_SIZE as u64 - 1)) as usize;
+        // A run too near the end of its segment to hold the links is a run that
+        // was never listed, and reading the links there would leave the
+        // segment.
+        if within + size_of::<Listed>() > SEGMENT_SIZE {
+            return None;
+        }
+        let node = self.listed(addr.offset());
+        (node.tag == LISTED_TAG).then_some(node.span as usize)
+    }
+
+    /// Take a run back off its size class list.
+    ///
+    /// Constant time, which is why the lists are doubly linked. A segment being
+    /// reclaimed gives its pages back, so every run it holds has to come off
+    /// before that happens, and a singly linked list would make emptying one
+    /// segment a walk of every list in the arena.
+    ///
+    /// # Panics
+    ///
+    /// If the run is not listed. Ask [`Arena::listed_at`] first.
+    pub fn unlist(&mut self, addr: Addr) {
+        let off = addr.offset();
+        let node = self.listed(off);
+        assert_eq!(node.tag, LISTED_TAG, "run at {off} is not on a list");
+        let class = node.span as usize / ALIGN - 1;
+        if node.prev == NONE {
+            debug_assert_eq!(self.heads[class], off, "an unlinked run says it is a head");
+            self.heads[class] = node.next;
+        } else {
+            let mut before = self.listed(node.prev);
+            before.next = node.next;
+            self.write_listed(node.prev, before);
+        }
+        if node.next != NONE {
+            let mut after = self.listed(node.next);
+            after.prev = node.prev;
+            self.write_listed(node.next, after);
+        }
+        // The tag goes, so a second unlist of the same run is caught rather
+        // than quietly rewriting somebody else's links.
+        self.write_listed(
+            off,
+            Listed {
+                tag: 0,
+                span: 0,
+                prev: NONE,
+                next: NONE,
+            },
+        );
+        self.segs[(off >> SEGMENT_SHIFT) as usize].listed -= 1;
+    }
+
+    /// Runs waiting on a size class list.
+    ///
+    /// For tests and for `INFO memory`. Adds up the per segment counts rather
+    /// than walking the lists, which keeps it linear in segments instead of in
+    /// runs.
+    pub fn listed_runs(&self) -> usize {
+        self.segs.iter().map(|s| s.listed as usize).sum()
     }
 
     /// Put an emptied segment back on the free list.
@@ -522,12 +922,23 @@ impl Arena {
     /// where the `*STORE` family ran at 0.30 to 0.55x because the arena was
     /// grow only.
     ///
+    /// The caller also has to have taken every freed run in the segment off its
+    /// size class list, with [`Arena::unlist`]. A reclaimed segment gives its
+    /// pages back and is bumped through again from the top, so a run of it left
+    /// on a list would be handed out to one caller while another is writing
+    /// over it. The segment counts what it has listed and this refuses to
+    /// proceed while that is not zero.
+    ///
     /// # Panics
     ///
     /// If `seg` is the segment being bumped, which still has a live cursor
-    /// pointing into it.
+    /// pointing into it, or if the segment still has runs on a size class list.
     pub fn reclaim(&mut self, seg: usize) {
         assert_ne!(seg, self.cur, "cannot reclaim the segment being bumped");
+        assert_eq!(
+            self.segs[seg].listed, 0,
+            "segment {seg} still has runs on a size class list"
+        );
         debug_assert!(
             !self.free_segs.contains(&seg),
             "segment {seg} is already on the free list"
@@ -1166,5 +1577,186 @@ mod tests {
         let mut a = Arena::new();
         let addr = a.put(b"").unwrap();
         assert_eq!(a.get(addr, 0), b"");
+    }
+
+    /// The whole point of the lists: a store that overwrites the same values
+    /// gets the same bytes back and the arena stops growing.
+    ///
+    /// This is tamnd/yo#518 in ten lines. Before the lists, the second write of
+    /// a key took a fresh run and left the first one for a collector to copy
+    /// its neighbours away from, which cost three bytes copied for every byte
+    /// written.
+    #[test]
+    fn a_freed_run_goes_straight_back_out_again() {
+        let mut a = Arena::new();
+        let first = a.put(&[1u8; 200]).unwrap();
+        a.free(first, 200);
+        assert_eq!(a.listed_runs(), 1);
+
+        let second = a.put(&[2u8; 200]).unwrap();
+        assert_eq!(second, first, "the same bytes should have come back");
+        assert_eq!(a.listed_runs(), 0);
+        assert_eq!(a.get(second, 200), &[2u8; 200][..]);
+        assert_eq!(a.live_bytes(), 208, "one run live, once");
+        assert_eq!(a.dead_bytes_total(), 0, "and nothing dead to collect");
+    }
+
+    /// A run only comes back for a request of its own size class. Nothing is
+    /// split and nothing is merged, so a request of another size takes the bump
+    /// pointer and leaves the run where it is.
+    #[test]
+    fn a_run_only_answers_its_own_size() {
+        let mut a = Arena::new();
+        let addr = a.put(&[0u8; 200]).unwrap();
+        a.free(addr, 200);
+
+        let other = a.put(&[0u8; 100]).unwrap();
+        assert_ne!(other, addr, "a smaller request must not take the run");
+        assert_eq!(a.listed_runs(), 1, "and must leave it on its list");
+
+        // 200 and 205 both round to the 208 byte class, so this one does take
+        // it. Exact fit is the slot, not the length asked for.
+        let same = a.put(&[0u8; 205]).unwrap();
+        assert_eq!(same, addr);
+        assert_eq!(a.listed_runs(), 0);
+    }
+
+    /// Runs below [`MIN_LISTED`] have nowhere to keep the links, and runs above
+    /// [`REUSE_MAX`] have no class, so both stay off the lists.
+    #[test]
+    fn the_ends_of_the_range_are_left_alone() {
+        let mut a = Arena::new();
+        let tiny = a.put(&[0u8; 8]).unwrap();
+        a.free(tiny, 8);
+        assert_eq!(a.listed_runs(), 0, "a 16 byte run cannot hold the links");
+
+        let big = a.put(&[0u8; REUSE_MAX + 1]).unwrap();
+        a.free(big, REUSE_MAX + 1);
+        assert_eq!(a.listed_runs(), 0, "past the last class");
+
+        let edge = a.put(&[0u8; REUSE_MAX]).unwrap();
+        a.free(edge, REUSE_MAX);
+        assert_eq!(a.listed_runs(), 1, "the last class itself is listed");
+    }
+
+    /// Many runs of the same size come back in the order they were freed, most
+    /// recent first, because the head is the one still in cache.
+    #[test]
+    fn the_last_run_freed_is_the_first_one_back() {
+        let mut a = Arena::new();
+        let addrs: Vec<Addr> = (0..8).map(|_| a.put(&[0u8; 64]).unwrap()).collect();
+        for addr in &addrs {
+            a.free(*addr, 64);
+        }
+        assert_eq!(a.listed_runs(), 8);
+        for want in addrs.iter().rev() {
+            assert_eq!(a.put(&[0u8; 64]).unwrap(), *want);
+        }
+        assert_eq!(a.listed_runs(), 0);
+    }
+
+    /// A run taken off the middle of a list leaves the list joined up.
+    #[test]
+    fn unlisting_the_middle_leaves_the_rest_reusable() {
+        let mut a = Arena::new();
+        let addrs: Vec<Addr> = (0..3).map(|_| a.put(&[0u8; 64]).unwrap()).collect();
+        for addr in &addrs {
+            a.free(*addr, 64);
+        }
+        // Freed in order, so the list runs 2, 1, 0 and this takes the middle.
+        assert_eq!(a.listed_at(addrs[1]), Some(64));
+        a.unlist(addrs[1]);
+        assert_eq!(a.listed_at(addrs[1]), None);
+        assert_eq!(a.listed_runs(), 2);
+
+        assert_eq!(a.put(&[0u8; 64]).unwrap(), addrs[2]);
+        assert_eq!(a.put(&[0u8; 64]).unwrap(), addrs[0]);
+        assert_eq!(a.listed_runs(), 0);
+    }
+
+    /// A segment cannot go back to the kernel while a list still points into
+    /// it. The pages would be handed away and then handed out again.
+    #[test]
+    #[should_panic(expected = "still has runs on a size class list")]
+    fn a_segment_with_a_listed_run_cannot_be_reclaimed() {
+        let mut a = Arena::new();
+        let first = a.put(&[0u8; 64]).unwrap();
+        let chunk = vec![0u8; 256 * 1024];
+        while a.segment_count() < 2 {
+            a.put(&chunk).unwrap();
+        }
+        a.free(first, 64);
+        a.reclaim(0);
+    }
+
+    /// And it can once the run has come off, which is the sequence compaction
+    /// walks a segment in.
+    #[test]
+    fn unlisting_first_lets_the_segment_go() {
+        let mut a = Arena::new();
+        let first = a.put(&[0u8; 64]).unwrap();
+        let chunk = vec![0u8; 256 * 1024];
+        while a.segment_count() < 2 {
+            a.put(&chunk).unwrap();
+        }
+        a.free(first, 64);
+        a.unlist(first);
+        a.reclaim(0);
+        assert_eq!(a.free_segments(), 1);
+        assert_eq!(a.listed_runs(), 0);
+    }
+
+    /// Compaction's copy takes from the bump pointer and never from a list. A
+    /// destination inside the segment being emptied would leave a live record
+    /// in a segment about to be reclaimed.
+    #[test]
+    fn a_copy_never_lands_on_a_listed_run() {
+        let mut a = Arena::new();
+        let hole = a.put(&[0u8; 64]).unwrap();
+        let live = a.put(&[9u8; 64]).unwrap();
+        a.free(hole, 64);
+        assert_eq!(a.listed_runs(), 1);
+
+        let moved = a.copy_within(live, 64);
+        assert_ne!(moved, hole, "the copy took the hole it was running from");
+        assert_eq!(a.get(moved, 64), &[9u8; 64][..]);
+        assert_eq!(a.listed_runs(), 1, "and left the hole where it was");
+    }
+
+    /// A store reusing its runs does not raise its own dead byte count, so
+    /// nothing sends a collector after space that has already come back.
+    #[test]
+    fn reuse_takes_the_dead_bytes_back_down() {
+        let mut a = Arena::new();
+        let mut addr = a.put(&[0u8; 200]).unwrap();
+        for _ in 0..1000 {
+            a.free(addr, 200);
+            assert_eq!(a.dead_bytes_total(), 208);
+            addr = a.put(&[0u8; 200]).unwrap();
+            assert_eq!(a.dead_bytes_total(), 0);
+        }
+        assert_eq!(a.segment_count(), 1, "a thousand writes in one segment");
+        assert_eq!(a.compaction_candidates(), Vec::<usize>::new());
+    }
+
+    /// Freed space piling up in sizes nothing asks for still counts as dead,
+    /// which is what keeps compaction on for the fragmentation a free list
+    /// cannot fix.
+    #[test]
+    fn space_nobody_wants_still_asks_to_be_compacted() {
+        let mut a = Arena::new();
+        let mut addrs = Vec::new();
+        while a.segment_count() < 2 {
+            addrs.push(a.put(&[0u8; 200]).unwrap());
+        }
+        for addr in addrs.iter().filter(|x| x.offset() < SEGMENT_SIZE as u64) {
+            a.free(*addr, 200);
+        }
+        assert!(a.listed_runs() > 0, "the runs are all on one list");
+        assert_eq!(
+            a.compaction_candidates(),
+            vec![0],
+            "and the segment still asks to be collected"
+        );
     }
 }

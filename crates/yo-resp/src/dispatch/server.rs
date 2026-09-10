@@ -1742,7 +1742,8 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 s,
                 "# Memory\r\nused_memory:{}\r\nused_memory_dataset:{}\r\n\
                  used_memory_overhead:{}\r\nmem_arena_bytes:{}\r\n\
-                 mem_arena_segments:{}\r\nmem_compact_walked:{}\r\n\
+                 mem_arena_segments:{}\r\nmem_arena_listed:{}\r\n\
+                 mem_compact_walked:{}\r\n\
                  mem_compact_moved:{}\r\nmem_compact_bytes:{}\r\n\
                  mem_index_bytes:{}\r\n\
                  mem_client_buffers:{}\r\ntotal_system_memory:{}\r\n\
@@ -1754,6 +1755,7 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 server.memory_bytes() - server.dataset_bytes(),
                 server.arena_bytes(),
                 server.segment_count(),
+                server.listed_runs(),
                 compact.walked,
                 compact.moved,
                 compact.bytes,

@@ -1420,6 +1420,20 @@ impl Server {
         )
     }
 
+    /// Freed runs waiting on an arena size class list, across every database.
+    ///
+    /// How much of the store's own garbage is already back in circulation. A
+    /// server whose value lengths repeat keeps a small number here and never
+    /// compacts, and a server whose lengths wander keeps a large one and does,
+    /// so the two numbers beside each other say which of the two collectors is
+    /// doing the work.
+    #[must_use]
+    pub fn listed_runs(&self) -> usize {
+        self.keyspaces()
+            .map(|db| db.map().arena().listed_runs())
+            .sum()
+    }
+
     /// Arena segments whose pages are real, across every database.
     #[must_use]
     pub fn segment_count(&self) -> usize {
