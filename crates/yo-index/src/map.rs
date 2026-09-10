@@ -9,14 +9,21 @@
 //! Layout of one record in the arena:
 //!
 //! ```text
-//! +--------+--------+-----------+-------------+
-//! | klen   | vlen   | key bytes | value bytes |
-//! | u32 LE | u32 LE | klen      | vlen        |
-//! +--------+--------+-----------+-------------+
+//! +--------+----------------+-----------+-------------+-------+
+//! | klen   | slack  | vlen  | key bytes | value bytes | slack |
+//! | u32 LE | 8 bits | 24    | klen      | vlen        | bytes |
+//! +--------+----------------+-----------+-------------+-------+
 //! ```
 //!
 //! Key and value live in one allocation so that a hit is one cache miss for the
 //! bucket and one for the record, not three.
+//!
+//! The slack is room the record has and is not using, in units of the arena's
+//! alignment, and it is there so that a value can be written over a shorter one
+//! without the record having to move. Everything that walks a segment steps by
+//! the run, which is the three lengths rounded up to the arena's alignment with
+//! the slack behind it, so a record still occupies exactly what its header says
+//! it does. A record fresh out of the arena has none.
 
 use crate::index::{Index, Keys};
 use crate::scan::Cursor;
@@ -26,6 +33,57 @@ use yo_common::{Addr, Space, bytes_eq, wyhash};
 
 /// Bytes of length prefix in front of a record.
 const HDR: usize = 8;
+
+/// Bits of the second header word that hold the value's length, leaving the top
+/// eight for the slack behind it.
+///
+/// A record cannot be longer than [`yo_arena::MAX_ALLOC`], which is a byte under
+/// two megabytes, so a value length has never needed more than twenty one bits
+/// and the top eleven have always been zero. Eight of them are the slack now and
+/// three are still spare.
+///
+/// The first word is left alone on purpose. The arena tells a freed run from a
+/// live one by comparing the four bytes at the front of it against `u32::MAX`,
+/// and the reason that is safe is that a key length cannot reach `u32::MAX`.
+/// Putting anything in the top of that word would put that argument at the mercy
+/// of whatever went in there.
+const VLEN_BITS: u32 = 24;
+
+/// The mask for the value length in that word.
+const VLEN_MASK: u32 = (1 << VLEN_BITS) - 1;
+
+/// The most slack a record can write down, which is what eight bits of
+/// [`yo_arena::ALIGN`] units come to.
+///
+/// A record bigger than sixteen kilobytes is held to this rather than to
+/// [`SLACK_SHARE`], which costs nothing worth arranging around: the share of a
+/// record that size is already more slack than any of the values this is for.
+const SLACK_MAX: usize = 255 * yo_arena::ALIGN;
+
+/// How much of a run may sit unused behind a value that shrank into it, as the
+/// divisor of a share: a quarter.
+///
+/// The number this trades off against is throughput, and both ends of it are
+/// real. Refusing all slack, which is what this did until now, means a key whose
+/// value changes length by a byte writes a whole new record, marks the old one
+/// dead and writes the index, and on the mixed length cell the harness runs that
+/// is all but every write. Allowing any amount of slack means a key's record
+/// settles at the largest value that key has ever held, and for values drawn
+/// uniformly from 1 to 1024 that is twice the memory of the average.
+///
+/// A quarter is the first point on that curve rather than the measured best of
+/// it. It bounds the waste at a quarter of a record at every moment, because a
+/// value that would leave more behind moves out and its old record is freed
+/// whole, and it takes about one write in eight in place on the mixed length
+/// cell against about one in a thousand before. Moving it is one constant and
+/// two tests, and what it should be is a question for a machine with counters on
+/// it rather than for this comment.
+const SLACK_SHARE: usize = 4;
+
+const _: () = {
+    assert!(yo_arena::MAX_ALLOC < 1 << VLEN_BITS);
+    assert!(SLACK_MAX.is_multiple_of(yo_arena::ALIGN));
+};
 
 /// The least a single [`RawMap::compact_step`] walks.
 ///
@@ -103,11 +161,45 @@ pub struct Compaction {
 struct Record;
 
 impl Record {
+    /// The key length, the value length, and the bytes of slack behind the
+    /// value.
+    #[inline]
+    fn head(bytes: &[u8]) -> (usize, usize, usize) {
+        let k = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let v = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        (
+            k,
+            (v & VLEN_MASK) as usize,
+            (v >> VLEN_BITS) as usize * yo_arena::ALIGN,
+        )
+    }
+
+    /// The two lengths, for the readers that only want to find the bytes.
     #[inline]
     fn lens(bytes: &[u8]) -> (usize, usize) {
-        let k = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-        let v = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+        let (k, v, _) = Self::head(bytes);
         (k, v)
+    }
+
+    /// The whole run a record occupies: itself rounded up to the arena's
+    /// alignment, and the slack behind that.
+    ///
+    /// This is the number a walk steps by and the number a free gives back, and
+    /// it is the whole reason the slack is written down at all. Without it the
+    /// only thing that says how much room a record has is how much of it is in
+    /// use, which is why a value that shrank had to move.
+    #[inline]
+    fn span(klen: usize, vlen: usize, slack: usize) -> usize {
+        (HDR + klen + vlen).next_multiple_of(yo_arena::ALIGN) + slack
+    }
+
+    /// The second header word: the value's length with the slack over it.
+    #[inline]
+    fn vword(vlen: usize, slack: usize) -> [u8; 4] {
+        debug_assert!(vlen <= VLEN_MASK as usize, "value too long for the field");
+        debug_assert!(slack <= SLACK_MAX, "more slack than the field can hold");
+        debug_assert!(slack.is_multiple_of(yo_arena::ALIGN), "unaligned slack");
+        (vlen as u32 | ((slack / yo_arena::ALIGN) as u32) << VLEN_BITS).to_le_bytes()
     }
 }
 
@@ -317,6 +409,20 @@ impl RawMap {
         self.index.get(hash, key, &Records { arena: &self.arena })
     }
 
+    /// The whole run the record at `addr` occupies: the header, the key, the
+    /// value, the rounding up to the arena's alignment, and any room the record
+    /// is holding and not using.
+    ///
+    /// What a key costs, rather than how much of it is in use, which is the
+    /// question `MEMORY USAGE` is asking and the one a real server answers by
+    /// asking its allocator how big the block it handed out really is.
+    #[inline]
+    #[must_use]
+    pub fn run_at(&self, addr: Addr) -> usize {
+        let (klen, vlen, slack) = Record::head(self.arena.get(addr, HDR));
+        Record::span(klen, vlen, slack)
+    }
+
     /// The value at an address this map handed out, with no probe.
     ///
     /// See [`RawMap::find`] for how long an address is worth holding.
@@ -415,6 +521,20 @@ impl RawMap {
         HDR
     }
 
+    /// The most room a run of `span` bytes may keep behind a value that shrank
+    /// into it, rather than giving the run back and taking one that fits.
+    ///
+    /// A share of the run and not a fixed number of bytes, because the thing
+    /// being bounded is waste, and a hundred bytes behind a hundred byte value
+    /// is a different amount of waste from a hundred bytes behind a megabyte.
+    /// Rounded down to the arena's alignment because that is the only unit the
+    /// header can write it in, which is what stops the smallest runs keeping any
+    /// slack at all: a quarter of a 48 byte run is 12 bytes and rounds to none.
+    #[inline]
+    fn slack_allowed(span: usize) -> usize {
+        (span / SLACK_SHARE / yo_arena::ALIGN * yo_arena::ALIGN).min(SLACK_MAX)
+    }
+
     /// Store a `vlen` byte value under `key`, written by `fill`.
     ///
     /// The same thing [`RawMap::set`] does, except that the caller writes
@@ -449,13 +569,17 @@ impl RawMap {
     {
         self.writes += 1;
         assert!(key.len() <= u32::MAX as usize, "key too long");
-        assert!(vlen <= u32::MAX as usize, "value too long");
+        // Against the field rather than against `u32`, because the top eight
+        // bits of that word are the slack now. A value this long would not fit
+        // in a segment either, and the allocation below says so, but a length
+        // that silently wrapped into the slack would corrupt the walk instead.
+        assert!(vlen <= VLEN_MASK as usize, "value too long");
         let total = HDR + key.len() + vlen;
         let h = wyhash(key, 0);
 
-        // A key that is already here, in a record exactly the size the new value
-        // needs, is written over where it lies. No allocation, no dead bytes, no
-        // index write, and nothing for compaction to collect later.
+        // A key that is already here, in a record with room for the new value,
+        // is written over where it lies. No allocation, no dead bytes, no index
+        // write, and nothing for compaction to collect later.
         //
         // This used to say the in place path had to wait for epochs, because a
         // reader that had already resolved the address would see a torn value.
@@ -467,33 +591,46 @@ impl RawMap {
         // the arena from another thread, both of these become an install rather
         // than an overwrite, together.
         //
-        // Exactly the size and not merely small enough. A shorter value in a
-        // longer record would leave the header disagreeing with the space the
-        // record occupies, and compaction walks a segment by stepping over each
-        // record by the length in its header, so the walk would land in the
-        // middle of the next one.
+        // Room and not the exact size. This used to say exactly, because the
+        // only thing that said how long a record's run was were the two lengths
+        // in its header, so a shorter value in a longer run would send the walk
+        // in `evacuate` into the middle of the next record. What is left over is
+        // written down now, in the top of the second header word, so the run is
+        // still exactly as long as the header says it is and the value inside it
+        // no longer has to fill it.
         //
         // Overwriting a key with a value the same size as the last one is what
         // half of the world's caches do, and it is what every SET benchmark
         // does. On gamingpc it was 25 percent of SET throughput at pipeline 16
         // and 37 percent of MSET, all of it spent making garbage and then
-        // collecting it.
+        // collecting it. A benchmark that draws its value sizes from a range,
+        // which is what the cache benchmark does and what a real cache holding
+        // rendered pages or session state looks like, hit that path about once
+        // in a thousand writes and pays the same cost on the other nine hundred
+        // and ninety nine.
         if let Some(addr) = self.index.get(h, key, &Records { arena: &self.arena }) {
-            let (klen, old_vlen) = Record::lens(self.arena.get(addr, HDR));
+            let (klen, old_vlen, old_slack) = Record::head(self.arena.get(addr, HDR));
             debug_assert_eq!(klen, key.len(), "the index matched a different key");
             // Before `fill`, because the in place path writes over exactly the
             // bytes `peek` is being handed. Once, and here rather than next to
             // the free below, because this is the branch that knows the key was
             // there and both paths out of it go past this line.
             peek(&self.arena.get(addr, HDR + klen + old_vlen)[HDR + klen..]);
-            if old_vlen == vlen {
+            let span = Record::span(klen, old_vlen, old_slack);
+            let want = total.next_multiple_of(yo_arena::ALIGN);
+            if want <= span && span - want <= Self::slack_allowed(span) {
                 let rec = self.arena.get_mut(addr, total);
+                // The header before the value, because `fill` is handed the
+                // slice this word describes and a closure that panicked partway
+                // through it must not leave a record claiming bytes it does not
+                // have.
+                rec[4..8].copy_from_slice(&Record::vword(vlen, span - want));
                 let tag = fill(&mut rec[HDR + klen..]);
                 // The record did not move, so this is the only thing that can
                 // have changed about where it stands: `PERSIST` on a key whose
                 // value is the same length is exactly this branch.
                 self.retag(addr, tag);
-                return Some(vlen);
+                return Some(old_vlen);
             }
         }
 
@@ -502,7 +639,7 @@ impl RawMap {
             .alloc(total)
             .expect("record is larger than a segment");
         buf[0..4].copy_from_slice(&(key.len() as u32).to_le_bytes());
-        buf[4..8].copy_from_slice(&(vlen as u32).to_le_bytes());
+        buf[4..8].copy_from_slice(&Record::vword(vlen, 0));
         // The arena hands back a run padded up to its alignment, so index to
         // `total` rather than to the end of the slice.
         buf[HDR..HDR + key.len()].copy_from_slice(key);
@@ -537,8 +674,8 @@ impl RawMap {
         }
         match old {
             Some(prev) => {
-                let (pk, pv) = Record::lens(self.arena.get(prev, HDR));
-                self.arena.free(prev, HDR + pk + pv);
+                let (pk, pv, ps) = Record::head(self.arena.get(prev, HDR));
+                self.arena.free(prev, Record::span(pk, pv, ps));
                 Some(pv)
             }
             None => None,
@@ -590,10 +727,10 @@ impl RawMap {
         };
         match addr {
             Some(a) => {
-                let (k, v) = Record::lens(self.arena.get(a, HDR));
+                let (k, v, s) = Record::head(self.arena.get(a, HDR));
                 peek(&self.arena.get(a, HDR + k + v)[HDR + k..]);
                 self.tagged.remove(a);
-                self.arena.free(a, HDR + k + v);
+                self.arena.free(a, Record::span(k, v, s));
                 true
             }
             None => false,
@@ -799,9 +936,9 @@ impl RawMap {
                 self.arena.unlist(old);
                 continue;
             }
-            let (klen, vlen) = Record::lens(self.arena.get(old, HDR));
+            let (klen, vlen, slack) = Record::head(self.arena.get(old, HDR));
             let total = HDR + klen + vlen;
-            off += total.next_multiple_of(yo_arena::ALIGN);
+            off += Record::span(klen, vlen, slack);
             self.compaction.walked += 1;
 
             let hash = {
@@ -819,6 +956,13 @@ impl RawMap {
             }
 
             let new = self.arena.copy_within(old, total);
+            if slack != 0 {
+                // The copy is the record without the room behind it. Compaction
+                // is the one moment a record is rewritten with nobody waiting on
+                // the reply, so it is the right place to hand back space a key
+                // took when its value was longer and has not asked for since.
+                self.arena.get_mut(new, HDR)[4..8].copy_from_slice(&Record::vword(vlen, 0));
+            }
             let bytes = self.arena.get(new, HDR + klen);
             let key = &bytes[HDR..];
             let recs = Records { arena: &self.arena };
@@ -833,7 +977,7 @@ impl RawMap {
             // Discarded rather than freed. The space is inside the segment
             // being emptied and must not be offered to anybody before the
             // segment comes back whole.
-            self.arena.discard(old, total);
+            self.arena.discard(old, Record::span(klen, vlen, slack));
             moved += 1;
             self.compaction.moved += 1;
             self.compaction.bytes += total as u64;
@@ -1061,8 +1205,8 @@ mod tests {
         assert!(m.value_mut(b"missing").is_none());
     }
 
-    /// A key overwritten with a value the same size stays in the record it is
-    /// already in, and one overwritten with a different size does not.
+    /// A key overwritten with a value that fits in the run it is already in
+    /// stays there, and one that needs a longer run does not.
     ///
     /// The first is the shape every SET benchmark and half the world's caches
     /// have: the same keys, the same value size, over and over. Writing a fresh
@@ -1088,13 +1232,156 @@ mod tests {
         assert_eq!(m.arena().live_bytes(), live, "a thousand writes, no growth");
         assert_eq!(m.arena().dead_bytes_total(), dead, "and nothing dead");
 
-        // A different length cannot go in the same hole, because the record has
-        // to be as long as its header says it is.
+        // One byte more still goes in the same hole. A header and a one byte key
+        // and eight bytes of value is seventeen bytes in a run of thirty two, so
+        // there were fifteen bytes spare all along and the ninth byte takes one
+        // of them.
         assert_eq!(m.set(b"k", b"123456789"), Some(8));
         assert_eq!(m.get(b"k"), Some(&b"123456789"[..]));
+        assert_eq!(m.arena().dead_bytes_total(), dead, "still nothing dead");
+
+        // A value that wants a longer run than the one the key is in cannot,
+        // whatever the slack rule says, so the record moves and the old one is
+        // dead.
+        assert_eq!(m.set(b"k", &[b'z'; 64]), Some(9));
+        assert_eq!(m.get(b"k"), Some(&[b'z'; 64][..]));
         assert!(
             m.arena().dead_bytes_total() > dead,
             "the old record is dead"
+        );
+    }
+
+    /// A value that shrank a little is written over the one it replaces and
+    /// keeps the room it is not using.
+    ///
+    /// This is tamnd/yo#531. Refusing anything but an exact length meant that on
+    /// a store whose values are drawn from a range, which is the workload the
+    /// cache benchmark runs and what a real cache holding rendered pages looks
+    /// like, all but about one write in a thousand allocated a record, marked
+    /// the old one dead and wrote the index.
+    #[test]
+    fn a_value_that_shrank_a_little_stays_where_it_is() {
+        let mut m = RawMap::new();
+        let at = |m: &RawMap| {
+            m.index()
+                .get(RawMap::hash_of(b"k"), b"k", &Records { arena: m.arena() })
+        };
+        m.set(b"k", &[b'z'; 200]);
+        let first = at(&m);
+        let dead = m.arena().dead_bytes_total();
+
+        // A header, a one byte key and two hundred bytes of value is 209 bytes
+        // in a run of 224, and a quarter of that run is 48 bytes. Down to 176
+        // the record wants 192 and leaves 32 behind, which is inside it.
+        assert_eq!(m.set(b"k", &[b'y'; 176]), Some(200));
+        assert_eq!(at(&m), first, "the record did not move");
+        assert_eq!(m.get(b"k"), Some(&[b'y'; 176][..]));
+        assert_eq!(m.arena().dead_bytes_total(), dead, "and nothing is dead");
+
+        // And back up again, into the room it kept.
+        assert_eq!(m.set(b"k", &[b'x'; 200]), Some(176));
+        assert_eq!(at(&m), first, "the record did not move");
+        assert_eq!(m.get(b"k"), Some(&[b'x'; 200][..]));
+        assert_eq!(m.arena().dead_bytes_total(), dead, "and nothing is dead");
+    }
+
+    /// A value that shrank a lot gives the run back rather than sitting in the
+    /// corner of it.
+    ///
+    /// The other half of the rule, and the half that bounds what this costs. A
+    /// record holds at most a quarter of its run unused at any moment, because
+    /// a write that would leave more behind takes a run that fits and frees the
+    /// one it was in whole.
+    #[test]
+    fn a_value_that_shrank_a_lot_hands_the_run_back() {
+        let mut m = RawMap::new();
+        let at = |m: &RawMap| {
+            m.index()
+                .get(RawMap::hash_of(b"k"), b"k", &Records { arena: m.arena() })
+        };
+        m.set(b"k", &[b'z'; 200]);
+        let first = at(&m);
+        let dead = m.arena().dead_bytes_total();
+
+        // Four bytes in a run of 224 leaves 208 behind, which is four times what
+        // the rule allows.
+        assert_eq!(m.set(b"k", b"tiny"), Some(200));
+        assert_ne!(at(&m), first, "the record moved");
+        assert_eq!(m.get(b"k"), Some(&b"tiny"[..]));
+        assert!(
+            m.arena().dead_bytes_total() > dead,
+            "the old record is dead"
+        );
+    }
+
+    /// Compaction walks a segment by stepping over each record by what its
+    /// header says, and a record holding room is the case that walk has to get
+    /// right.
+    ///
+    /// The one that would corrupt everything after it rather than losing one
+    /// key: a walk that stepped by the two lengths and not by the run would land
+    /// in the middle of the next record and read its bytes as a header.
+    ///
+    /// It also checks the other end of the slack, which is that compaction is
+    /// where it goes. Growing the key back to the length it had before the
+    /// shrink fits in the run it was in a moment ago and does not fit in the one
+    /// compaction gave it, so the record has to move, which is the room having
+    /// been handed back.
+    #[test]
+    fn compaction_walks_over_a_record_holding_room_and_takes_it_back() {
+        let mut m = RawMap::new();
+        let long = vec![b'z'; COMPACT_VAL];
+        let short = vec![b'y'; COMPACT_VAL - 200];
+        for i in 0..COMPACT_N {
+            m.set(&key(i), &long);
+        }
+
+        // Every key in the first segment shrinks where it lies, so the walk over
+        // that segment steps over nothing but records whose lengths no longer
+        // add up to their runs.
+        let dead = m.arena().dead_bytes_total();
+        let in_first = |m: &RawMap, i: usize| {
+            m.index()
+                .get(
+                    RawMap::hash_of(&key(i)),
+                    &key(i),
+                    &Records { arena: m.arena() },
+                )
+                .is_some_and(|a| a.offset() < yo_arena::SEGMENT_SIZE as u64)
+        };
+        let shrunk: Vec<usize> = (0..COMPACT_N).filter(|&i| in_first(&m, i)).collect();
+        for &i in &shrunk {
+            assert_eq!(m.set(&key(i), &short), Some(COMPACT_VAL));
+        }
+        assert!(
+            shrunk.len() > 1,
+            "the first segment held {} keys",
+            shrunk.len()
+        );
+        assert_eq!(
+            m.arena().dead_bytes_total(),
+            dead,
+            "every one of those shrinks stayed in place"
+        );
+
+        assert!(
+            m.compact_segment(0) > 0,
+            "the first segment had live records"
+        );
+        let dead = m.arena().dead_bytes_total();
+        for i in 0..COMPACT_N {
+            let want = if shrunk.contains(&i) {
+                COMPACT_VAL - 200
+            } else {
+                COMPACT_VAL
+            };
+            assert_eq!(m.get(&key(i)).map(<[u8]>::len), Some(want), "key {i}");
+        }
+
+        assert_eq!(m.set(&key(shrunk[0]), &long), Some(COMPACT_VAL - 200));
+        assert!(
+            m.arena().dead_bytes_total() > dead,
+            "compaction handed the room back, so the record had to move"
         );
     }
 

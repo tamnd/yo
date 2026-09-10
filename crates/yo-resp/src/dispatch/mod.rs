@@ -8835,10 +8835,15 @@ mod tests {
         );
         // A longer value under the same name costs more, and by about what the
         // extra bytes are, since a string lives in its own record.
+        //
+        // About and not exactly, because what is counted is the run the record
+        // sits in and a run is rounded up to the arena's alignment. Two runs can
+        // therefore differ by up to one more alignment than the values in them
+        // do, which is what the slack at either end of this is for.
         f.run(&[b"SET", b"s", &[b'x'; 1000]]);
         let big = int_of(&f.run(&[b"MEMORY", b"USAGE", b"s"]));
         assert!(
-            big - small >= 995 && big - small <= 1005,
+            big - small >= 980 && big - small <= 1020,
             "{small} then {big}"
         );
         // A collection costs its body, so a set of a hundred members is worth
