@@ -581,7 +581,7 @@ impl User {
 
 /// Whether two byte strings are equal, in time that does not depend on where
 /// they stop being equal.
-fn same(a: &[u8], b: &[u8]) -> bool {
+pub(super) fn same(a: &[u8], b: &[u8]) -> bool {
     let mut diff = u8::from(a.len() != b.len());
     for i in 0..a.len().max(b.len()) {
         diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0xff);

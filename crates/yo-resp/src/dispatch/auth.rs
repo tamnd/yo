@@ -47,6 +47,14 @@ pub(super) const NOAUTH: &str = "NOAUTH Authentication required.";
 /// spends a sentence here pointing at the option that solves it.
 pub(super) const HELLO_NOAUTH: &str = "NOAUTH HELLO must be called with the client already authenticated, otherwise the HELLO <proto> AUTH <user> <pass> option can be used to authenticate the client and select the RESP protocol version at the same time";
 
+/// The name a node of the cluster authenticates as rather than a user.
+///
+/// Matched exactly rather than case insensitively, which is the reference's
+/// `strcmp` and is worth keeping: `AUTH "INTERNAL CONNECTION" x` is a failed
+/// login as a user of that name and says so, rather than a failed internal
+/// login.
+const INTERNAL: &[u8] = b"internal connection";
+
 /// `AUTH password` or `AUTH username password`.
 pub(super) fn execute(
     server: &Server,
@@ -65,6 +73,12 @@ pub(super) fn execute(
     } else {
         (acl::DEFAULT, args.get(1))
     };
+    // The one user name that is not a user. It has a space in it, which no name
+    // an operator can write does, so there is nothing for it to collide with and
+    // the reference relies on the same thing.
+    if args.len() == 3 && user == INTERNAL {
+        return internal(server, session, password, out);
+    }
     if args.len() == 2 && !server.guarded() && is(user, acl::DEFAULT) {
         // The one message here that is not about the password being wrong. A
         // client that sends a one argument `AUTH` to a server with no password
@@ -83,6 +97,40 @@ pub(super) fn execute(
         out.error(b"WRONGPASS invalid username-password pair or user is disabled.");
         return Ok(());
     }
+    out.ok();
+    Ok(())
+}
+
+/// `AUTH "internal connection" <secret>`, which is one node of a cluster
+/// introducing itself to another one over an ordinary client connection.
+///
+/// The secret is the forty characters the bus gossips until the whole cluster
+/// agrees on one, so a client cannot get past this without already knowing
+/// something only the nodes know, and there is nothing to know at all on a
+/// server that is not a cluster node, which is why that case is refused before
+/// the password is looked at.
+///
+/// What it opens is the slot migration protocol, which is a state machine driven
+/// from the other end and not defended against being driven out of order,
+/// because the only thing that ever drives it is another node running the same
+/// code. That is the whole reason for the gate.
+fn internal(server: &Server, session: &mut Session, password: &[u8], out: &mut Out) -> Result<()> {
+    if !server.cluster_enabled() {
+        return Err(Error::new(
+            Code::Invalid,
+            "Cannot authenticate as an internal connection on non-cluster instances",
+        ));
+    }
+    let secret = server.cluster_secret();
+    if secret.is_empty() || !acl::same(secret.as_bytes(), password) {
+        // Written straight into the buffer for the same reason the ordinary
+        // wrong password line is: the code in front of it is what the far side
+        // branches on, and this is the only place that sends this one.
+        out.error(b"WRONGPASS invalid internal password");
+        return Ok(());
+    }
+    session.serve_internal(true);
+    session.admit(true);
     out.ok();
     Ok(())
 }

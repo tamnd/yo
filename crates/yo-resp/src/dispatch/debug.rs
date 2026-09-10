@@ -202,6 +202,24 @@ pub(super) fn execute(
         return packing(server, session, args.get(2), Packing::Listpack, out);
     } else if is(sub, b"QUICKLIST") && (3..=4).contains(&args.len()) {
         return packing(server, session, args.get(2), Packing::Quicklist, out);
+    } else if is(sub, b"MARK-INTERNAL-CLIENT")
+        && (args.len() == 2 || (args.len() == 3 && is(args.get(2), b"UNMARK")))
+    {
+        // The one way to become a node of the cluster without being one, which
+        // is what a test uses to drive the slot migration protocol by hand
+        // rather than standing up a second server.
+        session.serve_internal(args.len() == 2);
+        out.ok();
+    } else if is(sub, b"INTERNAL_SECRET") && args.len() == 2 {
+        // The secret itself never leaves the server, which is the point of it,
+        // so what comes back is a checksum of it. That is enough for a test to
+        // see that two nodes have converged on the same one and no use at all to
+        // anybody trying to log in with it.
+        let secret = server.cluster_secret();
+        if secret.is_empty() {
+            return Err(Error::new(Code::Invalid, "Internal secret is missing"));
+        }
+        out.int(i64::from(yo_common::crc::crc16(secret.as_bytes())));
     } else if is(sub, b"CHANGE-REPL-ID") && args.len() == 2 {
         server.change_id();
         out.ok();
@@ -889,10 +907,14 @@ const HELP: &[&str] = &[
     "ERROR <string>",
     "    Return a Redis protocol error with <string> as message. Useful for",
     "    clients unit tests to simulate Redis errors.",
+    "INTERNAL_SECRET",
+    "    Return the cluster internal secret (hashed with crc16) or error if not in cluster mode.",
     "LISTPACK <key>",
     "    Show low level info about the listpack encoding of <key>.",
     "LOG <message>",
     "    Write <message> to the server log.",
+    "MARK-INTERNAL-CLIENT [UNMARK]",
+    "    Promote the current connection to an internal connection.",
     "OBJECT <key>",
     "    Show low level info about `key` and associated value.",
     "PAUSE-CRON <0|1>",

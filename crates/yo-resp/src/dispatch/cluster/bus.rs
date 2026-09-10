@@ -366,7 +366,7 @@ pub(super) struct Bus {
     /// The shared secret nodes use to recognise each other. Forty hex characters
     /// made at start, and the whole cluster converges on whichever is smallest,
     /// which is a rule that needs no coordinator to settle.
-    secret: Lock<String>,
+    pub(super) secret: Lock<String>,
     /// Whether the threads are up, so that starting twice is a no-op.
     on: AtomicBool,
     /// Whether the table has changed since it was last written.
@@ -463,10 +463,6 @@ impl Server {
                 yo_alloc::allow(|| map.nodes[0].id.clone()),
             )
         };
-        {
-            let mut secret = self.cluster.bus.secret.lock();
-            *secret = String::from_utf8_lossy(&new_id()).into_owned();
-        }
         let door = TcpListener::bind(("0.0.0.0", port))
             .map_err(|e| format!("cluster bus port {port} could not be bound: {e}"))?;
         let _ = id;
