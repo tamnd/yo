@@ -1058,8 +1058,8 @@ spec = "12 section 9"
 
 [[divergence]]
 id = "D-149"
-title = "CLUSTER MEET and CLUSTER MIGRATION IMPORT wait on the cluster bus"
-reason = "A node learns about another node over the cluster bus, which is a binary protocol on the client port plus ten thousand that every node gossips over once a second. CLUSTER MEET is the one command that starts that off: it dials the address it was given on the bus port, sends a MEET packet, and from then on the two nodes tell each other about everybody else they know until the whole cluster has the same node table. Without the bus there is nothing for MEET to do that would not be a lie, so it is refused with its own sentence rather than answering OK and leaving an operator waiting for a second node to appear in CLUSTER NODES. Everything else that a multi node cluster needs is already here and written as though the table were full, so the bus fills the node table and changes nothing else: the slot table already has room for foreign owners, MOVED and ASK are already built against it and unit tested with a table filled by hand, and the config file already reads and writes foreign node lines. That is deliberate, because the bus is a protocol of its own and putting it in the same change as the slots would have made both of them harder to check. CLUSTER MIGRATION IMPORT is refused the same way and for the same reason, since the importing node drives that move by talking to the node it is taking the range from. Both commands check their arguments in full before they refuse, in the reference's order and with the reference's sentences, so a tool that builds a cluster finds out about a bad address or a bad slot range exactly where it would have."
+title = "CLUSTER MIGRATION IMPORT waits on the slot migration"
+reason = "CLUSTER MEET is in and works against a real server, so the half of this that was about the bus is closed. What is left is CLUSTER MIGRATION IMPORT, which is the command that tells a node to take a range of slots off another one and drive the move itself. That needs MIGRATE and the atomic slot handover behind it rather than anything about gossip, so it still checks every argument it was given in full, in the reference's order and with the reference's sentences, and then refuses. A tool that builds a cluster finds out about a bad address or a bad slot range exactly where it would have, and finds out that the move itself is not here yet only once everything it typed was right."
 status = "until"
 resolved_by = "M8"
 spec = "12 section 9"
@@ -1068,6 +1068,30 @@ spec = "12 section 9"
 id = "D-150"
 title = "The per slot key counts walk the whole database"
 reason = "A real server keeps a sorted set of every key by slot, so both of these are a lookup and a walk of one slot's worth of keys. Here there is no per slot index and both walk every key in the database and hash each one, which gives the same answer and costs the size of the keyspace rather than the size of the slot. The answers are identical and only the time is different, so nothing a client sees is wrong, but a resharding tool calls GETKEYSINSLOT in a loop over a slot it is moving and on a large keyspace that loop would be quadratic. Closing it means a second index keyed by slot, which is a real cost on every write on every server whether or not it is a cluster node, so it wants to be paid for by the slot migration work that actually needs it rather than by this change. Until then both commands carry the same warning a real server's own documentation carries about GETKEYSINSLOT, which is that it is for a resharding tool and not for a client. CLUSTER SLOT-STATS pays the same cost once rather than once per slot, because it tallies every key into a table of 16384 counters in a single walk."
+status = "until"
+resolved_by = "M8"
+spec = "12 section 9"
+
+[[divergence]]
+id = "D-151"
+title = "The cluster bus runs on its own threads"
+reason = "A real server has one event loop and the bus lives in it, so a gossip packet and a client command are two callbacks on the same thread and neither can be running while the other is. Here the bus has a thread for the listener, a thread for each link and one for the cron, because the code that speaks the bus protocol sits in yo-resp and the poller that runs the client connections sits in yo-cli, and reaching down from one to the other would put the whole of the cluster protocol on the wrong side of the line the crates are split along. The cost is that the node table has to be a lock rather than something only one thread touches, and everything the bus does under that lock has to be careful not to take it twice. The affordable part is the traffic: one packet a second per node means a cluster of a hundred nodes is a hundred packets a second across a hundred threads that are asleep the rest of the time, which is nothing next to what one client connection costs. Closing this means a poller the whole process shares, which is worth doing for its own sake and is the same change D-115 wants for the pub/sub wakeup, so it is written down here rather than done twice."
+status = "until"
+resolved_by = "M9"
+spec = "12 section 9"
+
+[[divergence]]
+id = "D-152"
+title = "A replica does not stand for election when its master fails"
+reason = "The bus carries the failure detection: a node that stops answering is marked possibly failed, that opinion is gossiped, and once a majority of the masters that can see it agree the node is marked failed and the cluster says so. What it does not carry yet is the vote that comes after, where a replica of the failed master asks every master for permission to take its slots and takes them once it has a majority. That is five more packet types' worth of behaviour with a rank, a delay and an epoch to get right, and getting it wrong is the one bug in a cluster that loses data rather than answers slowly, so it is a change of its own with its own differential rather than the tail of the one that put the protocol in. Until then a cluster whose master fails is a cluster that reports the failure, keeps serving every slot the failure did not touch, and waits for an operator to run CLUSTER FAILOVER on the replica by hand. The three packet types the vote uses are parsed and answered as well formed today, so a real server in the same cluster asking for a vote is not confused by the silence, it simply does not get one from here."
+status = "until"
+resolved_by = "M8"
+spec = "12 section 9"
+
+[[divergence]]
+id = "D-153"
+title = "The replication heartbeat period is not a setting"
+reason = "A master pings a replication link that has gone quiet so that a replica can tell a link that has died from a master with nothing to say, and so that a server nobody is writing to still moves its offset. That is in, on its own thread, at the reference's default of ten seconds. What is not in is repl-ping-replica-period, along with repl-timeout and the rest of the replication settings, because the config table does not carry them yet and adding one of them without the others would leave a server that answers CONFIG GET for a setting it half implements. So the number is the default rather than a lookup, which is what nearly every deployment runs anyway, and the whole group goes in together with the config table work."
 status = "until"
 resolved_by = "M8"
 spec = "12 section 9"

@@ -666,6 +666,12 @@ fn publish(server: &Server, args: Args<'_>, out: &mut Out, kind: Kind) {
     if repl::armed() {
         repl::rewrite(&[args.get(0), args.get(1), args.get(2)]);
     }
+    // On a cluster node the message has to reach the subscribers on every other
+    // node too, and that is true whether or not anybody here is listening, so it
+    // goes out in front of the check that makes a publish to an empty server
+    // free. The count in the reply is still this node's own subscribers, which
+    // is what a real server reports.
+    server.cluster_publish(kind == Kind::Shard, args.get(1), args.get(2));
     if !server.anyone_subscribed() {
         out.uint(0);
         return;

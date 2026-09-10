@@ -32320,6 +32320,26 @@ mod tests {
         Fixture::on(server)
     }
 
+    /// The runs come out in slot order and not in node order, which is the
+    /// order a real server walks and the order a client that caches the reply
+    /// by position is counting on.
+    #[test]
+    fn cluster_slots_comes_out_in_slot_order() {
+        let mut f = clustered();
+        for slot in 0..100u16 {
+            f.server.cluster_hand_over(slot, 1);
+        }
+        let reply = f.run(&[b"CLUSTER", b"SLOTS"]);
+        assert!(
+            reply.starts_with("*2\r\n*3\r\n:0\r\n:99\r\n*4\r\n$8\r\n10.0.0.9\r\n:7002\r\n"),
+            "the other node's run is first because it starts at slot 0: {reply}"
+        );
+        assert!(
+            reply.contains("*3\r\n:100\r\n:16383\r\n"),
+            "and this node's run is the rest of them: {reply}"
+        );
+    }
+
     /// A key in a slot somebody else owns is a redirection and not an answer.
     #[test]
     fn a_key_on_another_node_is_moved_there() {

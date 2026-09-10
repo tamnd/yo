@@ -54,6 +54,8 @@ use crate::reply::Out;
 
 use super::Server;
 use super::args::{self, Args};
+
+mod bus;
 use super::keyspec;
 use super::table::Spec;
 
@@ -169,7 +171,24 @@ pub fn key_slot(key: &[u8]) -> u16 {
 
 // ---------------------------------------------------------------- the table
 
-/// One node in the cluster, which for now is only ever this one.
+/// The reference's own node flag bits.
+///
+/// Kept as its bits rather than as a set of booleans because they go out on the
+/// bus in exactly this shape and come back in it, so anything else would be two
+/// translations for no gain.
+pub(crate) const FLAG_MASTER: u16 = 1;
+pub(crate) const FLAG_SLAVE: u16 = 2;
+pub(crate) const FLAG_PFAIL: u16 = 4;
+pub(crate) const FLAG_FAIL: u16 = 8;
+pub(crate) const FLAG_MYSELF: u16 = 16;
+pub(crate) const FLAG_HANDSHAKE: u16 = 32;
+pub(crate) const FLAG_NOADDR: u16 = 64;
+pub(crate) const FLAG_MEET: u16 = 128;
+pub(crate) const FLAG_MIGRATE_TO: u16 = 256;
+pub(crate) const FLAG_NOFAILOVER: u16 = 512;
+pub(crate) const FLAG_EXTENSIONS: u16 = 1024;
+
+/// One node in the cluster, which is this one and everybody the bus has found.
 #[derive(Clone)]
 struct Node {
     /// The forty hex characters that name it, which never change while it lives.
@@ -179,22 +198,109 @@ struct Node {
     host: String,
     /// The port a client reaches it on.
     port: u16,
+    /// The port the bus reaches it on, which is nearly always the client port
+    /// plus ten thousand but is carried separately because a node behind a port
+    /// map announces something else.
+    bus: u16,
     /// Which shard it belongs to, which is a master and its replicas.
     shard: String,
     /// The config epoch it claims its slots under.
     epoch: u64,
+    /// What it is and how it is doing, in the reference's bits.
+    flags: u16,
+    /// The master it follows, as an index into the same table.
+    master: Option<u16>,
+    /// When a ping went out to it with no pong back yet, or nought for none
+    /// outstanding, which is the field the timeout is measured from.
+    ping_sent: u64,
+    /// When the last pong came back.
+    pong_recv: u64,
+    /// When anything at all last arrived from it. A node under a heavy pub/sub
+    /// load can be slow with its pong and perfectly alive, so traffic of any
+    /// kind counts as proof it is there.
+    data_recv: u64,
+    /// When this node decided it had failed.
+    fail_time: u64,
+    /// The replication offset it last put in a packet.
+    offset: u64,
+    /// Whether there is an outbound link to it at the moment.
+    linked: bool,
+    /// Who has said it is unreachable and when they last said so, which is the
+    /// weak quorum the FAIL flag needs.
+    reports: Vec<(String, u64)>,
 }
 
 impl Node {
+    /// A node with nothing known about it but where it is.
+    fn new(id: String, host: String, port: u16, bus: u16, flags: u16, now: u64) -> Node {
+        Node {
+            id,
+            host,
+            port,
+            bus,
+            shard: String::from_utf8_lossy(&new_id()).into_owned(),
+            epoch: 0,
+            flags,
+            master: None,
+            ping_sent: 0,
+            // Both stamps start at zero and not at now, which is the reference's
+            // own rule and is what makes the `myself` line read `0 0`. Nothing
+            // has been heard from a node that was made a moment ago, and saying
+            // otherwise would also hold off the first ping for a second.
+            pong_recv: 0,
+            // This one does start at now, because it stands in for the creation
+            // time as well and the handshake timeout is measured against it.
+            data_recv: now,
+            fail_time: 0,
+            offset: 0,
+            linked: false,
+            reports: Vec::new(),
+        }
+    }
+
+    /// Whether it is a master, which is the reference's rule that anything not
+    /// flagged a replica counts as one.
+    fn is_master(&self) -> bool {
+        self.flags & FLAG_SLAVE == 0
+    }
+
+    /// Whether it is down as far as anybody can tell.
+    fn down(&self) -> bool {
+        self.flags & (FLAG_PFAIL | FLAG_FAIL) != 0
+    }
+
+    /// The comma separated flag list a `CLUSTER NODES` line carries, in the
+    /// reference's own order, with `noflags` for a node with none of them.
+    fn flag_names(&self, into: &mut String) {
+        const NAMES: [(u16, &str); 8] = [
+            (FLAG_MYSELF, "myself"),
+            (FLAG_MASTER, "master"),
+            (FLAG_SLAVE, "slave"),
+            (FLAG_PFAIL, "fail?"),
+            (FLAG_FAIL, "fail"),
+            (FLAG_HANDSHAKE, "handshake"),
+            (FLAG_NOADDR, "noaddr"),
+            (FLAG_NOFAILOVER, "nofailover"),
+        ];
+        let mut first = true;
+        for (bit, name) in NAMES {
+            if self.flags & bit == 0 {
+                continue;
+            }
+            if !first {
+                into.push(',');
+            }
+            into.push_str(name);
+            first = false;
+        }
+        if first {
+            into.push_str("noflags");
+        }
+    }
+
     /// The `ip:port@bus` field of a `CLUSTER NODES` line.
     fn address(&self, into: &mut String) {
-        let _ = write!(
-            into,
-            "{}:{}@{}",
-            self.host,
-            self.port,
-            self.port + BUS_OFFSET
-        );
+        let _ = write!(into, "{}:{}@{}", self.host, self.port, self.bus);
     }
 
     /// The same field with the aux fields on the end of it, which is what goes in
@@ -241,6 +347,41 @@ impl Map {
             .iter()
             .position(|n| n.id.as_bytes() == id)
             .map(|at| at as u16)
+    }
+
+    /// Drop a node and everything that pointed at it.
+    ///
+    /// Every other table here holds an index into `nodes`, so dropping one out
+    /// of the middle means walking them and shifting anything above it down.
+    /// That is fine because a node leaves a cluster about as often as an
+    /// operator types, and holding ids instead of indices everywhere would cost
+    /// a string compare on the routing path, which is the one path that has to
+    /// be fast.
+    fn forget(&mut self, at: u16) {
+        self.nodes.remove(usize::from(at));
+        let shift = |slot: &mut Option<u16>| match *slot {
+            Some(node) if node == at => *slot = None,
+            Some(node) if node > at => *slot = Some(node - 1),
+            _ => {}
+        };
+        for slot in 0..SLOTS {
+            shift(&mut self.owner[slot]);
+            shift(&mut self.migrating[slot]);
+            shift(&mut self.importing[slot]);
+        }
+        for node in &mut self.nodes {
+            shift(&mut node.master);
+        }
+    }
+
+    /// How many masters are serving at least one slot and have not failed, which
+    /// is the electorate a FAIL vote is counted against.
+    fn voters(&self) -> usize {
+        let mut seen = vec![false; self.nodes.len()];
+        for owner in self.owner.iter().flatten() {
+            seen[*owner as usize] = true;
+        }
+        seen.iter().filter(|s| **s).count()
     }
 
     /// Whether this node owns `slot`, which is index nought owning it.
@@ -316,6 +457,9 @@ pub(crate) struct Cluster {
     reads_when_down: AtomicBool,
     /// Where the table is written, under the server's `dir`.
     file: Lock<String>,
+    /// The links, the blacklist and the secret, none of which exist until the
+    /// bus is started and none of which a command reads on the hot path.
+    bus: bus::Bus,
 }
 
 impl Default for Cluster {
@@ -335,6 +479,7 @@ impl Default for Cluster {
             full_coverage: AtomicBool::new(true),
             reads_when_down: AtomicBool::new(false),
             file: Lock::new(String::new()),
+            bus: bus::Bus::default(),
         }
     }
 }
@@ -355,12 +500,16 @@ impl Server {
     pub fn enable_cluster(&mut self, file: &str, port: u16) {
         self.cluster.on = true;
         self.cluster.booted_at.store(self.now_ms(), Relaxed);
-        let me = yo_alloc::allow(|| Node {
-            id: String::from_utf8_lossy(&new_id()).into_owned(),
-            host: String::new(),
-            port,
-            shard: String::from_utf8_lossy(&new_id()).into_owned(),
-            epoch: 0,
+        let now = self.now_ms();
+        let me = yo_alloc::allow(|| {
+            Node::new(
+                String::from_utf8_lossy(&new_id()).into_owned(),
+                String::new(),
+                port,
+                port + BUS_OFFSET,
+                FLAG_MYSELF | FLAG_MASTER,
+                now,
+            )
         });
         // Under the server's directory when the name is a bare one, which is
         // what a real server does with `cluster-config-file`: it takes the
@@ -683,14 +832,16 @@ pub(super) fn execute(
         () if args::is(sub, b"nodes") => nodes(server, out),
         () if args::is(sub, b"slots") => reply_slots(server, out),
         () if args::is(sub, b"shards") => shards(server, out),
-        () if args::is(sub, b"links") => out.array(0),
+        () if args::is(sub, b"links") => server.cluster_links(out),
         () if args::is(sub, b"slaves") || args::is(sub, b"replicas") => {
-            known(server, args.get(2))?;
-            out.array(0);
+            replicas(server, args.get(2), out)?;
         }
         () if args::is(sub, b"count-failure-reports") => {
-            known(server, args.get(2))?;
-            out.int(0);
+            let map = server.cluster.map.lock();
+            let Some(at) = map.find(args.get(2)) else {
+                return Err(unknown_node(args.get(2)));
+            };
+            out.int(map.nodes[usize::from(at)].reports.len() as i64);
         }
         () if args::is(sub, b"countkeysinslot") => count_keys(server, session_db, args, out)?,
         () if args::is(sub, b"getkeysinslot") => get_keys(server, session_db, args, out)?,
@@ -733,21 +884,12 @@ pub(super) fn execute(
             out.ok();
         }
         () if args::is(sub, b"forget") => {
-            let map = server.cluster.map.lock();
-            if map.find(args.get(2)) == Some(0) {
-                return Err(Error::new(
-                    Code::Invalid,
-                    "I tried hard but I can't forget myself...",
-                ));
-            }
-            return Err(unknown_node(args.get(2)));
+            forget(server, args.get(2))?;
+            out.ok();
         }
         () if args::is(sub, b"replicate") => {
-            let map = server.cluster.map.lock();
-            if map.find(args.get(2)) == Some(0) {
-                return Err(Error::new(Code::Invalid, "Can't replicate myself"));
-            }
-            return Err(unknown_node(args.get(2)));
+            replicate(server, session_db, args.get(2))?;
+            out.ok();
         }
         () if args::is(sub, b"failover") => {
             if args.len() > 3 {
@@ -768,8 +910,9 @@ pub(super) fn execute(
             if args.len() > 5 {
                 return Err(sub_syntax(sub));
             }
-            meet(&args)?;
-            return Err(no_bus("CLUSTER MEET"));
+            let (host, port, bus) = meet(&args)?;
+            server.cluster_meet(&host, port, bus);
+            out.ok();
         }
         () if args::is(sub, b"help") => help(out),
         _ => return Err(args::unknown_subcommand(sub, "CLUSTER")),
@@ -806,15 +949,6 @@ fn dont_know(id: &[u8]) -> Error {
         Code::Invalid,
         format_args!("I don't know about node {}", String::from_utf8_lossy(id)),
     )
-}
-
-/// Refuse an id that is not a node this one knows.
-fn known(server: &Server, id: &[u8]) -> Result<()> {
-    let map = server.cluster.map.lock();
-    if map.find(id).is_none() {
-        return Err(unknown_node(id));
-    }
-    Ok(())
 }
 
 /// The arity of each subcommand, taken from the reference's own table, or `None`
@@ -954,59 +1088,121 @@ fn nodes(server: &Server, out: &mut Out) {
 fn lines(server: &Server, on_disk: bool) -> String {
     let map = server.cluster.map.lock();
     let mut s = String::with_capacity(256);
-    for (at, node) in map.nodes.iter().enumerate() {
-        let at = at as u16;
-        s.push_str(&node.id);
-        s.push(' ');
-        if on_disk {
-            node.address_on_disk(&mut s);
-        } else {
-            node.address(&mut s);
-        }
-        let flags = if at == 0 { "myself,master" } else { "master" };
-        let _ = write!(s, " {flags} - 0 0 {} connected", node.epoch);
-        for (from, to) in map.runs(at) {
-            if from == to {
-                let _ = write!(s, " {from}");
-            } else {
-                let _ = write!(s, " {from}-{to}");
-            }
-        }
-        if at == 0 {
-            for slot in 0..SLOTS {
-                if let Some(to) = map.migrating[slot] {
-                    let _ = write!(s, " [{slot}->-{}]", map.nodes[to as usize].id);
-                }
-                if let Some(from) = map.importing[slot] {
-                    let _ = write!(s, " [{slot}-<-{}]", map.nodes[from as usize].id);
-                }
-            }
-        }
+    for at in 0..map.nodes.len() as u16 {
+        describe(&map, at, on_disk, &mut s);
         s.push('\n');
     }
     s
 }
 
+/// One node's line, without the newline, which `CLUSTER REPLICAS` wants one at a
+/// time and `CLUSTER NODES` wants all of.
+fn describe(map: &Map, at: u16, on_disk: bool, s: &mut String) {
+    let node = &map.nodes[usize::from(at)];
+    s.push_str(&node.id);
+    s.push(' ');
+    if on_disk {
+        node.address_on_disk(s);
+    } else {
+        node.address(s);
+    }
+    s.push(' ');
+    node.flag_names(s);
+    s.push(' ');
+    match node.master.and_then(|m| map.nodes.get(usize::from(m))) {
+        Some(master) => s.push_str(&master.id),
+        None => s.push('-'),
+    }
+    // A replica reports its master's epoch rather than its own, which is what a
+    // client reading the line is actually asking about.
+    let epoch = match node.master.and_then(|m| map.nodes.get(usize::from(m))) {
+        Some(master) => master.epoch,
+        None => node.epoch,
+    };
+    let link = if node.linked || at == 0 {
+        "connected"
+    } else {
+        "disconnected"
+    };
+    let _ = write!(s, " {} {} {epoch} {link}", node.ping_sent, node.pong_recv);
+    for (from, to) in map.runs(at) {
+        if from == to {
+            let _ = write!(s, " {from}");
+        } else {
+            let _ = write!(s, " {from}-{to}");
+        }
+    }
+    if at == 0 {
+        for slot in 0..SLOTS {
+            if let Some(to) = map.migrating[slot] {
+                let _ = write!(s, " [{slot}->-{}]", map.nodes[to as usize].id);
+            }
+            if let Some(from) = map.importing[slot] {
+                let _ = write!(s, " [{slot}-<-{}]", map.nodes[from as usize].id);
+            }
+        }
+    }
+}
+
 /// `CLUSTER SLOTS`, which is one entry per run of slots one node owns.
+///
+/// The runs come out in slot order and not in node order, because that is the
+/// order the reference walks and a client that caches this reply by position
+/// will notice the difference.
 fn reply_slots(server: &Server, out: &mut Out) {
+    let mine = server.repl_offset();
     let map = server.cluster.map.lock();
     let at = out.len();
     let mut n = 0;
-    for node in 0..map.nodes.len() as u16 {
-        for (from, to) in map.runs(node) {
-            out.array(3);
-            out.int(i64::from(from));
-            out.int(i64::from(to));
-            let held = &map.nodes[node as usize];
-            out.array(4);
-            out.bulk(held.host.as_bytes());
-            out.int(i64::from(held.port));
-            out.bulk(held.id.as_bytes());
-            out.array(0);
-            n += 1;
+    let mut run: Option<(u16, u16)> = None;
+    for slot in 0..=SLOTS as u16 {
+        let owner = if slot as usize == SLOTS {
+            None
+        } else {
+            map.owner[slot as usize]
+        };
+        match run {
+            Some((node, _)) if owner == Some(node) => {}
+            Some((node, from)) => {
+                slot_run(&map, node, from, slot - 1, mine, out);
+                n += 1;
+                run = owner.map(|node| (node, slot));
+            }
+            None => run = owner.map(|node| (node, slot)),
         }
     }
     out.close_array(at, n);
+}
+
+/// One `CLUSTER SLOTS` entry: the run, its owner, then the owner's replicas.
+///
+/// A replica everybody agrees is gone is left out, and so is one whose
+/// replication offset is still zero, which is the reference's own filter and is
+/// its way of saying this replica has never caught up with anything and is not
+/// somewhere to send a reader yet. This node's own offset does not come off the
+/// table, since nothing gossips a node its own offset, so it is passed in.
+fn slot_run(map: &Map, node: u16, from: u16, to: u16, mine: u64, out: &mut Out) {
+    let replicas: Vec<&Node> = map
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(at, n)| {
+            let offset = if *at == 0 { mine } else { n.offset };
+            n.master == Some(node) && n.flags & FLAG_FAIL == 0 && offset != 0
+        })
+        .map(|(_, n)| n)
+        .collect();
+    out.array(3 + replicas.len());
+    out.int(i64::from(from));
+    out.int(i64::from(to));
+    let held = &map.nodes[node as usize];
+    for held in std::iter::once(held).chain(replicas.iter().copied()) {
+        out.array(4);
+        out.bulk(held.host.as_bytes());
+        out.int(i64::from(held.port));
+        out.bulk(held.id.as_bytes());
+        out.array(0);
+    }
 }
 
 /// `CLUSTER SHARDS`, which is the same information grouped by shard rather than
@@ -1015,32 +1211,62 @@ fn shards(server: &Server, out: &mut Out) {
     let map = server.cluster.map.lock();
     let at = out.len();
     let mut n = 0;
-    for (node, held) in map.nodes.iter().enumerate() {
+    let mut done: Vec<&str> = Vec::new();
+    for node in 0..map.nodes.len() {
+        let shard = map.nodes[node].shard.as_str();
+        if done.contains(&shard) {
+            continue;
+        }
+        done.push(shard);
+        let members: Vec<usize> = (0..map.nodes.len())
+            .filter(|other| map.nodes[*other].shard == shard)
+            .collect();
+        // The slots of a shard are the slots of whichever member is holding
+        // them, which is the master of it except for the moment after a
+        // failover when two members still think they are.
+        let runs: Vec<(u16, u16)> = members
+            .iter()
+            .flat_map(|member| map.runs(*member as u16))
+            .collect();
         out.map(2);
         out.bulk(b"slots");
-        let runs = map.runs(node as u16);
         out.array(runs.len() * 2);
         for (from, to) in runs {
             out.int(i64::from(from));
             out.int(i64::from(to));
         }
         out.bulk(b"nodes");
-        out.array(1);
-        out.map(7);
-        out.bulk(b"id");
-        out.bulk(held.id.as_bytes());
-        out.bulk(b"port");
-        out.int(i64::from(held.port));
-        out.bulk(b"ip");
-        out.bulk(held.host.as_bytes());
-        out.bulk(b"endpoint");
-        out.bulk(held.host.as_bytes());
-        out.bulk(b"role");
-        out.bulk(b"master");
-        out.bulk(b"replication-offset");
-        out.int(server.repl_offset() as i64);
-        out.bulk(b"health");
-        out.bulk(b"online");
+        out.array(members.len());
+        for member in members {
+            let held = &map.nodes[member];
+            out.map(7);
+            out.bulk(b"id");
+            out.bulk(held.id.as_bytes());
+            out.bulk(b"port");
+            out.int(i64::from(held.port));
+            out.bulk(b"ip");
+            out.bulk(held.host.as_bytes());
+            out.bulk(b"endpoint");
+            out.bulk(held.host.as_bytes());
+            out.bulk(b"role");
+            out.bulk(if held.is_master() {
+                b"master".as_slice()
+            } else {
+                b"replica".as_slice()
+            });
+            out.bulk(b"replication-offset");
+            out.int(if member == 0 {
+                server.repl_offset() as i64
+            } else {
+                held.offset as i64
+            });
+            out.bulk(b"health");
+            out.bulk(match held.flags {
+                f if f & FLAG_FAIL != 0 => b"fail".as_slice(),
+                f if f & FLAG_PFAIL != 0 => b"loading".as_slice(),
+                _ => b"online".as_slice(),
+            });
+        }
         n += 1;
     }
     out.close_array(at, n);
@@ -1205,12 +1431,10 @@ fn add_or_del(server: &Server, args: Args<'_>, add: bool, ranged: bool) -> Resul
 
 /// The address `CLUSTER MEET` was given, checked the way the reference checks it.
 ///
-/// Nothing can be done with the address until the bus is in, but the checking is
-/// worth having now, because a tool that builds a cluster reads these sentences
-/// and the order they come in is part of the answer. The port is reported back
-/// as the caller typed it rather than as it parsed, which is the reference's
-/// wording and matters for a port that parsed fine and was out of range.
-fn meet(args: &Args<'_>) -> Result<()> {
+/// The port is reported back as the caller typed it rather than as it parsed,
+/// which is the reference's wording and matters for a port that parsed fine and
+/// was out of range.
+fn meet(args: &Args<'_>) -> Result<(String, u16, u16)> {
     let host = String::from_utf8_lossy(args.get(2));
     let typed = String::from_utf8_lossy(args.get(3));
     let port = args.int(3).map_err(|_| {
@@ -1237,6 +1461,115 @@ fn meet(args: &Args<'_>) -> Result<()> {
             format_args!("Invalid node address specified: {host}:{typed}"),
         ));
     }
+    let bus = if bus == 0 {
+        port + i64::from(BUS_OFFSET)
+    } else {
+        bus
+    };
+    let host = yo_alloc::allow(|| host.into_owned());
+    Ok((host, port as u16, bus as u16))
+}
+
+/// `CLUSTER REPLICAS`, which is one `CLUSTER NODES` line per replica of a node.
+fn replicas(server: &Server, id: &[u8], out: &mut Out) -> Result<()> {
+    let map = server.cluster.map.lock();
+    let Some(at) = map.find(id) else {
+        return Err(unknown_node(id));
+    };
+    if !map.nodes[usize::from(at)].is_master() {
+        return Err(Error::new(
+            Code::Invalid,
+            "The specified node is not a master",
+        ));
+    }
+    let start = out.len();
+    let mut n = 0;
+    for other in 0..map.nodes.len() as u16 {
+        if map.nodes[usize::from(other)].master != Some(at) {
+            continue;
+        }
+        let line = yo_alloc::allow(|| {
+            let mut s = String::with_capacity(256);
+            describe(&map, other, false, &mut s);
+            s
+        });
+        out.bulk(line.as_bytes());
+        n += 1;
+    }
+    out.close_array(start, n);
+    Ok(())
+}
+
+/// `CLUSTER FORGET`, which drops a node and makes the drop stick.
+///
+/// An id nobody has heard of is an error unless it is one this node forgot on
+/// purpose a moment ago, in which case the answer is OK, because a tool that
+/// sends the same forget to every node in the cluster should not hear an error
+/// from the ones that had already been told by gossip.
+fn forget(server: &Server, id: &[u8]) -> Result<()> {
+    let at = {
+        let map = server.cluster.map.lock();
+        match map.find(id) {
+            Some(0) => {
+                return Err(Error::new(
+                    Code::Invalid,
+                    "I tried hard but I can't forget myself...",
+                ));
+            }
+            Some(at) if map.nodes[0].master == Some(at) => {
+                return Err(Error::new(Code::Invalid, "Can't forget my master!"));
+            }
+            Some(at) => at,
+            None => {
+                let name = String::from_utf8_lossy(id);
+                if server.cluster_blacklisted(&name) {
+                    return Ok(());
+                }
+                return Err(unknown_node(id));
+            }
+        }
+    };
+    server.cluster_forget(at);
+    Ok(())
+}
+
+/// `CLUSTER REPLICATE`, which makes this node a replica of another.
+///
+/// A master with slots or keys refuses, which is the reference's rule and is the
+/// right one: the slots would be given away silently and the keys in them would
+/// be answered for by two nodes at once.
+fn replicate(server: &Server, db: usize, id: &[u8]) -> Result<()> {
+    let at = {
+        let map = server.cluster.map.lock();
+        match map.find(id) {
+            None => return Err(unknown_node(id)),
+            Some(0) => return Err(Error::new(Code::Invalid, "Can't replicate myself")),
+            Some(at) if !map.nodes[usize::from(at)].is_master() => {
+                return Err(Error::new(
+                    Code::Invalid,
+                    "I can only replicate a master, not a replica.",
+                ));
+            }
+            Some(at) => {
+                if map.nodes[0].is_master()
+                    && (!map.runs(0).is_empty() || !server.dbs[db].is_empty())
+                {
+                    return Err(Error::new(
+                        Code::Invalid,
+                        "To set a master the node must be empty and without assigned slots.",
+                    ));
+                }
+                at
+            }
+        }
+    };
+    let Some(shared) = server.myself() else {
+        return Err(Error::new(
+            Code::Invalid,
+            "CLUSTER REPLICATE is not available on an embedded server",
+        ));
+    };
+    shared.cluster_replicate(at);
     Ok(())
 }
 
@@ -1532,6 +1865,11 @@ fn reset(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         }
         map.nodes.truncate(1);
         map.nodes[0].epoch = 0;
+        // A reset makes this node a master of nothing again, which is the half
+        // of it a soft reset does as well: it stops following anybody and it
+        // forgets everybody, it just keeps its name.
+        map.nodes[0].flags = FLAG_MYSELF | FLAG_MASTER;
+        map.nodes[0].master = None;
         if hard {
             yo_alloc::allow(|| {
                 map.nodes[0].id = String::from_utf8_lossy(&new_id()).into_owned();
@@ -1651,8 +1989,15 @@ impl Server {
     /// The parse, split out so that a test can hand it text without a file.
     fn absorb_cluster(&mut self, text: &str) -> Result<()> {
         let bad = |what: &str| Error::fmt(Code::Invalid, format_args!("{what} in cluster config"));
+        let now = self.now_ms();
         let mut nodes: Vec<Node> = Vec::new();
-        let mut owned: Vec<(usize, u16, u16)> = Vec::new();
+        // Slot runs are kept against the owner's id and not against its position
+        // in the list, because this node moves to the front of the list when its
+        // own line turns up and every position recorded before that moves down.
+        let mut owned: Vec<(String, u16, u16)> = Vec::new();
+        // The master field names a node that may not have been read yet, so
+        // both ends are kept as ids and resolved once every line is in.
+        let mut follows: Vec<(String, String)> = Vec::new();
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() {
@@ -1676,16 +2021,18 @@ impl Server {
                 return Err(bad("bad node id"));
             }
             let address = words.next().ok_or_else(|| bad("missing address"))?;
-            let flags = words.next().ok_or_else(|| bad("missing flags"))?;
-            // master, ping-sent, pong-received, then the epoch and the link.
-            let mut skipped = words.by_ref().skip(3);
-            let epoch = skipped
+            let named = words.next().ok_or_else(|| bad("missing flags"))?;
+            let master = words.next().ok_or_else(|| bad("missing master"))?;
+            let ping = words.next().ok_or_else(|| bad("missing ping time"))?;
+            let pong = words.next().ok_or_else(|| bad("missing pong time"))?;
+            let epoch = words
                 .next()
                 .and_then(|w| w.parse::<u64>().ok())
                 .ok_or_else(|| bad("bad config epoch"))?;
+            // The link state field, which is read past rather than read.
             let _link = words.next();
-            let (host, port, shard) = split_address(address).ok_or_else(|| bad("bad address"))?;
-            let at = nodes.len();
+            let (host, port, bus, shard) =
+                split_address(address).ok_or_else(|| bad("bad address"))?;
             for word in words {
                 // The migrating and importing markers are re-read from the
                 // brackets below rather than here, since they name a node that
@@ -1706,20 +2053,54 @@ impl Server {
                 if usize::from(from) >= SLOTS || usize::from(to) >= SLOTS || from > to {
                     return Err(bad("slot out of range"));
                 }
-                owned.push((at, from, to));
+                owned.push((first.to_owned(), from, to));
+            }
+            let mut flags = 0u16;
+            for name in named.split(',') {
+                flags |= match name {
+                    "myself" => FLAG_MYSELF,
+                    "master" => FLAG_MASTER,
+                    "slave" => FLAG_SLAVE,
+                    "fail?" => FLAG_PFAIL,
+                    "fail" => FLAG_FAIL,
+                    "handshake" => FLAG_HANDSHAKE,
+                    "noaddr" => FLAG_NOADDR,
+                    "nofailover" => FLAG_NOFAILOVER,
+                    _ => 0,
+                };
+            }
+            if master != "-" {
+                if master.len() != ID_LEN {
+                    return Err(bad("bad master id"));
+                }
+                follows.push((first.to_owned(), master.to_owned()));
             }
             let node = Node {
                 id: first.to_owned(),
                 host,
                 port,
+                bus,
                 shard,
                 epoch,
+                flags,
+                master: None,
+                // The two timestamps come back as now rather than as what the
+                // file says, because a file written an hour ago would otherwise
+                // put every node in it straight past the failure timeout. All
+                // the file is really recording is whether a ping was in flight.
+                ping_sent: stamp(ping, now),
+                pong_recv: stamp(pong, now),
+                data_recv: now,
+                fail_time: 0,
+                offset: 0,
+                // The link state in the file is written for a human reading it
+                // and is not read back. There is no link to anybody at startup,
+                // and saying otherwise would stop the bus ever dialling out.
+                linked: false,
+                reports: Vec::new(),
             };
-            if flags.split(',').any(|f| f == "myself") {
+            if named.split(',').any(|f| f == "myself") {
                 // This node goes first, and everything already read moves down.
-                for run in &mut owned {
-                    run.0 += 1;
-                }
                 nodes.insert(0, node);
             } else {
                 nodes.push(node);
@@ -1730,13 +2111,41 @@ impl Server {
         }
         let mut map = Map::new(nodes.remove(0));
         map.nodes.append(&mut nodes);
-        for (at, from, to) in owned {
+        for (id, from, to) in owned {
+            let Some(at) = map.find(id.as_bytes()) else {
+                return Err(bad("slots for a node nobody knows"));
+            };
             for slot in from..=to {
-                map.owner[usize::from(slot)] = Some(at as u16);
+                map.owner[usize::from(slot)] = Some(at);
             }
+        }
+        for (who, whose) in follows {
+            let (Some(who), Some(whose)) = (map.find(who.as_bytes()), map.find(whose.as_bytes()))
+            else {
+                return Err(bad("master id nobody knows"));
+            };
+            map.nodes[usize::from(who)].master = Some(whose);
+            // A replica's config epoch is its master's business, so the file's
+            // value is dropped rather than believed. Keeping it would let a
+            // replica that was a master an hour ago outvote the node that took
+            // its slots the moment it came back.
+            map.nodes[usize::from(who)].epoch = 0;
         }
         *self.cluster.map.lock() = map;
         Ok(())
+    }
+}
+
+/// One of the two timestamps out of the node table, read as a yes or a no.
+///
+/// The reference does the same thing for the same reason. The number in the
+/// file was taken from a clock that has since moved on, and all the reader can
+/// usefully learn from it is whether there was a ping in flight when the file
+/// was written, so a number that is not zero comes back as the time now.
+fn stamp(field: &str, now: u64) -> u64 {
+    match field.parse::<u64>() {
+        Ok(0) | Err(_) => 0,
+        Ok(_) => now,
     }
 }
 
@@ -1746,13 +2155,18 @@ impl Server {
 /// optional hostname in front of them, and a build that adds one has to leave a
 /// build that does not able to read the file, so everything but the shard id is
 /// skipped rather than being counted.
-fn split_address(field: &str) -> Option<(String, u16, String)> {
+fn split_address(field: &str) -> Option<(String, u16, u16, String)> {
     let (address, aux) = match field.split_once(',') {
         Some((address, aux)) => (address, aux),
         None => (field, ""),
     };
     let (host, ports) = address.rsplit_once(':')?;
-    let port = ports.split('@').next()?.parse::<u16>().ok()?;
+    let (client, bus) = match ports.split_once('@') {
+        Some((client, bus)) => (client, bus.parse::<u16>().ok()?),
+        None => (ports, 0),
+    };
+    let port = client.parse::<u16>().ok()?;
+    let bus = if bus == 0 { port + BUS_OFFSET } else { bus };
     let shard = aux
         .split(',')
         .find_map(|pair| pair.strip_prefix("shard-id="))
@@ -1760,7 +2174,7 @@ fn split_address(field: &str) -> Option<(String, u16, String)> {
             || String::from_utf8_lossy(&new_id()).into_owned(),
             str::to_owned,
         );
-    Some((host.to_owned(), port, shard))
+    Some((host.to_owned(), port, bus, shard))
 }
 
 // ------------------------------------------------------- the hand filled map
@@ -1790,13 +2204,17 @@ impl Server {
     /// Put a node in the table that nobody has met, and answer its index.
     pub(super) fn cluster_pretend_node(&self, id: &str, host: &str, port: u16) -> u16 {
         let mut map = self.cluster.map.lock();
-        map.nodes.push(Node {
-            id: id.to_owned(),
-            host: host.to_owned(),
+        let mut node = Node::new(
+            id.to_owned(),
+            host.to_owned(),
             port,
-            shard: id.to_owned(),
-            epoch: 0,
-        });
+            port + BUS_OFFSET,
+            FLAG_MASTER,
+            0,
+        );
+        node.shard = id.to_owned();
+        node.linked = true;
+        map.nodes.push(node);
         (map.nodes.len() - 1) as u16
     }
 
@@ -1862,5 +2280,66 @@ mod tests {
             seen[usize::from(slot)] = true;
         }
         assert!(seen.iter().all(|s| *s), "200k keys reach all 16384 slots");
+    }
+
+    /// Reading the node table back has to put every run of slots on the node
+    /// that owns it, including when this node's own line is not the first one.
+    ///
+    /// It is worth a test of its own because the failure is silent and only
+    /// shows up on a cluster with three nodes in it: this node moves to the
+    /// front of the list when its line is read, everything read before it moves
+    /// down one, and a run recorded against a position rather than against an
+    /// id ends up on the wrong node.
+    #[test]
+    fn a_config_file_puts_every_run_on_the_node_that_owns_it() {
+        let mut server = super::Server::new();
+        server.enable_cluster("", 7355);
+        let text = "\
+3b80b05445f38bc7214f083696a2bbf90e3f30e3 127.0.0.1:7356@17356 master - 0 0 0 connected 10923-16383
+30d0651b0ec5e178e082634c44fb9adcc6e4021b 127.0.0.1:7355@17355 myself,master - 0 0 1 connected 5461-10922
+19a9e69b8b66016ac43c55ccdeed0283e0148e17 127.0.0.1:7354@17354 master - 0 0 2 connected 0-5460
+vars currentEpoch 2 lastVoteEpoch 0
+";
+        server.absorb_cluster(text).expect("the file parses");
+        let map = server.cluster.map.lock();
+        let at = |id: &str| map.find(id.as_bytes()).expect("the node is in the table");
+        assert_eq!(at("30d0651b0ec5e178e082634c44fb9adcc6e4021b"), 0, "myself");
+        for (id, from, to) in [
+            ("19a9e69b8b66016ac43c55ccdeed0283e0148e17", 0, 5460),
+            ("30d0651b0ec5e178e082634c44fb9adcc6e4021b", 5461, 10922),
+            ("3b80b05445f38bc7214f083696a2bbf90e3f30e3", 10923, 16383),
+        ] {
+            let owner = Some(at(id));
+            for slot in from..=to {
+                assert_eq!(map.owner[slot], owner, "slot {slot} belongs to {id}");
+            }
+        }
+    }
+
+    /// Three fields in the node table say what was true when it was written and
+    /// not what is true now, and reading them back as if they were live state
+    /// is what stops a restarted node ever dialling anybody again.
+    #[test]
+    fn a_config_file_is_not_read_back_as_live_state() {
+        let mut server = super::Server::new();
+        server.enable_cluster("", 7357);
+        let text = "\
+9fcbb7624dedbb2fd0020dd2fbf86a5eb8cec31b 127.0.0.1:7355@17355 master - 0 1789005531306 3 connected 5461-10922
+ac6dd51a69741dc5130637c594866c9b7e0cfc4e 127.0.0.1:7357@17357 myself,slave 9fcbb7624dedbb2fd0020dd2fbf86a5eb8cec31b 1789005400000 1789005532315 3 connected
+";
+        server.absorb_cluster(text).expect("the file parses");
+        let now = server.now_ms();
+        let map = server.cluster.map.lock();
+        for node in &map.nodes {
+            assert!(!node.linked, "nothing is linked before the bus dials out");
+        }
+        // A ping that was in flight comes back as one sent now, and a ping that
+        // was not stays at zero, which is the difference the cron reads.
+        assert_eq!(map.nodes[0].ping_sent, now, "myself had a ping in flight");
+        assert_eq!(map.nodes[1].ping_sent, 0, "the master did not");
+        assert_eq!(map.nodes[0].pong_recv, now);
+        // And a replica's config epoch belongs to its master, not to the file.
+        assert_eq!(map.nodes[0].epoch, 0, "the replica's epoch is dropped");
+        assert_eq!(map.nodes[1].epoch, 3, "the master's is kept");
     }
 }
