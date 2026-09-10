@@ -1243,8 +1243,8 @@ mod tests {
         // A value that wants a longer run than the one the key is in cannot,
         // whatever the slack rule says, so the record moves and the old one is
         // dead.
-        assert_eq!(m.set(b"k", &vec![b'z'; 64]), Some(9));
-        assert_eq!(m.get(b"k"), Some(&vec![b'z'; 64][..]));
+        assert_eq!(m.set(b"k", &[b'z'; 64]), Some(9));
+        assert_eq!(m.get(b"k"), Some(&[b'z'; 64][..]));
         assert!(
             m.arena().dead_bytes_total() > dead,
             "the old record is dead"
@@ -1266,22 +1266,22 @@ mod tests {
             m.index()
                 .get(RawMap::hash_of(b"k"), b"k", &Records { arena: m.arena() })
         };
-        m.set(b"k", &vec![b'z'; 200]);
+        m.set(b"k", &[b'z'; 200]);
         let first = at(&m);
         let dead = m.arena().dead_bytes_total();
 
         // A header, a one byte key and two hundred bytes of value is 209 bytes
         // in a run of 224, and a quarter of that run is 48 bytes. Down to 176
         // the record wants 192 and leaves 32 behind, which is inside it.
-        assert_eq!(m.set(b"k", &vec![b'y'; 176]), Some(200));
+        assert_eq!(m.set(b"k", &[b'y'; 176]), Some(200));
         assert_eq!(at(&m), first, "the record did not move");
-        assert_eq!(m.get(b"k"), Some(&vec![b'y'; 176][..]));
+        assert_eq!(m.get(b"k"), Some(&[b'y'; 176][..]));
         assert_eq!(m.arena().dead_bytes_total(), dead, "and nothing is dead");
 
         // And back up again, into the room it kept.
-        assert_eq!(m.set(b"k", &vec![b'x'; 200]), Some(176));
+        assert_eq!(m.set(b"k", &[b'x'; 200]), Some(176));
         assert_eq!(at(&m), first, "the record did not move");
-        assert_eq!(m.get(b"k"), Some(&vec![b'x'; 200][..]));
+        assert_eq!(m.get(b"k"), Some(&[b'x'; 200][..]));
         assert_eq!(m.arena().dead_bytes_total(), dead, "and nothing is dead");
     }
 
@@ -1299,7 +1299,7 @@ mod tests {
             m.index()
                 .get(RawMap::hash_of(b"k"), b"k", &Records { arena: m.arena() })
         };
-        m.set(b"k", &vec![b'z'; 200]);
+        m.set(b"k", &[b'z'; 200]);
         let first = at(&m);
         let dead = m.arena().dead_bytes_total();
 
