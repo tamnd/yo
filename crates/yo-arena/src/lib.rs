@@ -841,7 +841,7 @@ impl Arena {
     ///
     /// The tag can be trusted where a magic number usually cannot. The first
     /// four bytes of a live record are its key length, a key is at most
-    /// [`MAX_ALLOC`] bytes, and [`LISTED_TAG`] is `u32::MAX`, so no live record
+    /// [`MAX_ALLOC`] bytes, and the tag is `u32::MAX`, so no live record
     /// can read as listed.
     #[inline]
     pub fn listed_at(&self, addr: Addr) -> Option<usize> {
