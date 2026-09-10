@@ -785,6 +785,20 @@ impl RawMap {
         let mut off = from;
         while off < stop {
             let old = Addr::new(Space::Arena, base + off as u64);
+            // Ask the arena before reading anything as a record. A run that was
+            // freed and put on a size class list has the arena's links written
+            // over the front of it, so the lengths this walk steps by are not
+            // there to read, and the run has to come off its list before the
+            // segment goes back: a reclaimed segment gives its pages away and
+            // is bumped through again, so a run of it still on a list would be
+            // handed to one caller while another writes over it. The span the
+            // arena gives back is already rounded to its alignment.
+            if let Some(span) = self.arena.listed_at(old) {
+                off += span;
+                self.compaction.walked += 1;
+                self.arena.unlist(old);
+                continue;
+            }
             let (klen, vlen) = Record::lens(self.arena.get(old, HDR));
             let total = HDR + klen + vlen;
             off += total.next_multiple_of(yo_arena::ALIGN);
@@ -816,7 +830,10 @@ impl RawMap {
             if self.tagged.remove(old) {
                 self.tagged.insert(new);
             }
-            self.arena.free(old, total);
+            // Discarded rather than freed. The space is inside the segment
+            // being emptied and must not be offered to anybody before the
+            // segment comes back whole.
+            self.arena.discard(old, total);
             moved += 1;
             self.compaction.moved += 1;
             self.compaction.bytes += total as u64;
@@ -1259,6 +1276,66 @@ mod tests {
         assert_eq!(m.tagged_len(), 1);
         assert!(m.del(b"k"));
         assert_eq!(m.tagged_len(), 0);
+    }
+
+    /// A store rewriting keys at mixed sizes gets its space back from the free
+    /// lists rather than from a collector copying every live record around it.
+    ///
+    /// This is tamnd/yo#518. The harness draws its value length uniformly from
+    /// 1 to 1024, so the in place path in [`RawMap::set_with`] almost never
+    /// fires and every write left a hole nothing could use. Compaction was then
+    /// the only way space came back, and it copies the live records that share
+    /// a segment with the hole, which at the ratio it starts at is three bytes
+    /// copied for every byte written. On the eight core box that read 138
+    /// thousand sets a second against 605 thousand for a fixed length, from the
+    /// value length and nothing else.
+    ///
+    /// The lengths repeat across passes, which is the property that matters:
+    /// what a pass frees is what the next pass asks for. The assertion is on
+    /// bytes copied and not on throughput, because copying is the cost and a
+    /// test cannot time anything. With the lists off it copies 67 MB to write
+    /// 23 MB, which is the 2.85 the server measured. With them on it copies
+    /// nothing at all, because no segment ever reaches the ratio. The bar is
+    /// set at half rather than at zero so that a change which leaves a little
+    /// for the collector to do is not a failure.
+    #[test]
+    fn rewriting_at_mixed_sizes_reuses_instead_of_copying() {
+        let mut m = RawMap::new();
+        const N: usize = COMPACT_N;
+        // Twelve lengths spread over the harness's range, all of them under the
+        // arena's largest reusable class.
+        let len = |i: usize| 64 + (i % 12) * 96;
+        let write = |m: &mut RawMap, pass: usize| {
+            for i in 0..N {
+                m.set(&key(i), &vec![b'z'; len(i + pass)]);
+                m.compact_step();
+            }
+        };
+
+        write(&mut m, 0);
+        let after_first = m.arena().reserved_bytes();
+        let start = m.compaction().bytes;
+
+        let mut written = 0u64;
+        for pass in 1..6 {
+            write(&mut m, pass);
+            written += (0..N).map(|i| len(i + pass) as u64).sum::<u64>();
+        }
+        let copied = m.compaction().bytes - start;
+
+        assert!(
+            copied < written / 2,
+            "copied {copied} bytes to write {written}, which is the shape the \
+             free lists exist to fix"
+        );
+        assert!(
+            m.arena().reserved_bytes() <= after_first * 2,
+            "held {} after six passes against {after_first} after one",
+            m.arena().reserved_bytes()
+        );
+        for i in 0..N {
+            assert_eq!(m.get(&key(i)).map(<[u8]>::len), Some(len(i + 5)), "key {i}");
+        }
     }
 
     /// The bug this exists for: overwriting a key writes a new record and only
