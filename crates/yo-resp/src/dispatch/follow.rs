@@ -798,19 +798,24 @@ fn apply(server: &Server, session: &mut Session, argv: &Argv, buf: &[u8], out: &
 // --------------------------------------------------------------- the socket
 
 /// The socket and whatever has arrived on it that has not been used yet.
-struct Link {
+///
+/// Shared with the slot migration in `cluster::import`, which dials another node
+/// and reads a stream of commands off it exactly the way a replica reads its
+/// master, down to the bare newlines the far side sends while it is getting
+/// ready. Two copies of this would be two places for the same off by one.
+pub(super) struct Link {
     sock: TcpStream,
     buf: Vec<u8>,
 }
 
 impl Link {
     /// What has arrived and not been used.
-    fn held(&self) -> &[u8] {
+    pub(super) fn held(&self) -> &[u8] {
         &self.buf
     }
 
     /// Take the first `n` bytes off the front and answer with them.
-    fn take(&mut self, n: usize) -> Vec<u8> {
+    pub(super) fn take(&mut self, n: usize) -> Vec<u8> {
         self.buf.drain(..n).collect()
     }
 
@@ -820,7 +825,7 @@ impl Link {
     /// lets the caller look around between reads. End of file is a failure,
     /// because a master that closed the socket is a link that has to be dialled
     /// again.
-    fn fill(&mut self, wait: Duration) -> std::io::Result<()> {
+    pub(super) fn fill(&mut self, wait: Duration) -> std::io::Result<()> {
         self.sock.set_read_timeout(Some(wait))?;
         let mut chunk = [0u8; 16 * 1024];
         match self.sock.read(&mut chunk) {
@@ -835,7 +840,7 @@ impl Link {
     }
 
     /// One line, without its newline, waiting at most `wait` in total.
-    fn line(&mut self, wait: Duration) -> std::io::Result<Vec<u8>> {
+    pub(super) fn line(&mut self, wait: Duration) -> std::io::Result<Vec<u8>> {
         let until = Instant::now() + wait;
         loop {
             if let Some(at) = self.buf.iter().position(|&b| b == b'\n') {
@@ -861,13 +866,13 @@ impl Link {
     }
 
     /// Send a command and read the one line it is answered with.
-    fn command(&mut self, parts: &[&[u8]]) -> std::io::Result<Vec<u8>> {
+    pub(super) fn command(&mut self, parts: &[&[u8]]) -> std::io::Result<Vec<u8>> {
         self.write(parts)?;
         self.line(HANDSHAKE_TIMEOUT)
     }
 
     /// Send a command and do not wait for anything.
-    fn write(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+    pub(super) fn write(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
         let mut wire = Vec::with_capacity(32);
         wire.extend_from_slice(b"*");
         wire.extend_from_slice(parts.len().to_string().as_bytes());
@@ -928,7 +933,7 @@ fn soft(e: &std::io::Error) -> bool {
 /// A link failure with a sentence on it, which nobody reads and which is worth
 /// writing anyway: the moment one of these needs a log line, the sentence is
 /// already there.
-fn broken(why: &str) -> std::io::Error {
+pub(super) fn broken(why: &str) -> std::io::Error {
     std::io::Error::other(String::from(why))
 }
 
@@ -944,7 +949,14 @@ fn fixed_id(word: &[u8]) -> Option<[u8; ID_LEN]> {
 
 /// Open the socket.
 fn dial(to: &Upstream) -> std::io::Result<Link> {
-    let at = (to.host.as_str(), to.port)
+    connect(&to.host, to.port)
+}
+
+/// Open a socket to a node and wrap it, which is what a slot migration does
+/// twice: once for the channel it takes the changes down and once for the
+/// channel it takes the snapshot down.
+pub(super) fn connect(host: &str, port: u16) -> std::io::Result<Link> {
+    let at = (host, port)
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| broken("the master's address does not resolve"))?;

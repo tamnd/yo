@@ -178,9 +178,12 @@ pub(crate) enum Migration {
 ///
 /// The reference's `asmState`, and the words are its `asmTaskStateToString`,
 /// because they go out on the wire in `CLUSTER MIGRATION STATUS` and a tool
-/// reads them. Only the states this node can actually be in are here; the rest
-/// belong to the side that starts a migration and to the streams that are not
-/// written yet.
+/// reads them.
+///
+/// One list for both ends of a move, because one task on one node is only ever
+/// one of the two and the wire has one field for it. The first block is the
+/// states either end can be in, the second is a migration going out and the
+/// third is an import coming in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum State {
     /// Made and not started, which is what an import task sits at until the
@@ -208,18 +211,43 @@ pub(super) enum State {
     /// Nothing more is coming and the far side has been told so. All that is
     /// left is for it to claim the slots.
     StreamEof,
-    /// What the far side calls itself while it is working through the changes
-    /// that piled up behind the snapshot. Only ever set as the other end's
-    /// state, never as this node's own.
+    /// Dialling the node the slots are coming from.
+    Connecting,
+    /// The password has gone out and the answer to it has not come back.
+    AuthReply,
+    /// About to say who this node is.
+    SendHandshake,
+    /// Having said, and waiting to be told that is fine.
+    HandshakeReply,
+    /// About to ask for the slots.
+    SendSyncslots,
+    /// Having asked, and waiting to be told to open the second connection.
+    SyncslotsReply,
+    /// Opening that second connection.
+    InitRdbchannel,
+    /// Taking the snapshot down the second connection while the changes since
+    /// pile up unread on the first.
+    AccumulateBuf,
+    /// The snapshot is in and the pile has not been started on.
+    ReadyToStream,
+    /// Working through the changes that piled up behind the snapshot.
     StreamingBuf,
-    /// And what it calls itself once that pile is empty and it is waiting to be
-    /// told there is no more coming.
+    /// That pile is empty and this node is caught up and waiting to be told
+    /// there is no more coming.
     WaitStreamEof,
+    /// There is no more coming and the slots are being claimed.
+    Takeover,
+    /// About to ask for the snapshot on the second connection.
+    RdbchannelRequest,
+    /// Having asked, and waiting to be told it is on its way.
+    RdbchannelReply,
+    /// The snapshot is coming down the second connection.
+    RdbchannelTransfer,
 }
 
 impl State {
     /// The word this state goes out as.
-    fn word(self) -> &'static str {
+    pub(super) fn word(self) -> &'static str {
         match self {
             State::None => "none",
             State::Canceled => "canceled",
@@ -231,8 +259,21 @@ impl State {
             State::HandoffPrep => "handoff-prep",
             State::Handoff => "handoff",
             State::StreamEof => "stream-eof",
+            State::Connecting => "connecting",
+            State::AuthReply => "auth-reply",
+            State::SendHandshake => "send-handshake",
+            State::HandshakeReply => "handshake-reply",
+            State::SendSyncslots => "send-syncslots",
+            State::SyncslotsReply => "syncslots-reply",
+            State::InitRdbchannel => "init-rdbchannel",
+            State::AccumulateBuf => "accumulate-buffer",
+            State::ReadyToStream => "ready-to-stream",
             State::StreamingBuf => "streaming-buffer",
             State::WaitStreamEof => "wait-stream-eof",
+            State::Takeover => "takeover",
+            State::RdbchannelRequest => "rdbchannel-request",
+            State::RdbchannelReply => "rdbchannel-reply",
+            State::RdbchannelTransfer => "rdbchannel-transfer",
         }
     }
 
@@ -476,6 +517,25 @@ impl Asm {
         }
     }
 
+    /// The first range of an import already running that touches any of these,
+    /// which is a second import of the same slots and is refused by name.
+    ///
+    /// A migration going the other way is not one of these. That is refused too,
+    /// but as one task at a time rather than as an overlap, which is the
+    /// reference's split and is the more useful of the two sentences: overlapping
+    /// says the slots are the problem and in progress says the node is.
+    pub(super) fn overlapping_import(&self, ranges: &[(u16, u16)]) -> Option<(u16, u16)> {
+        let tasks = self.inner.lock();
+        let task = tasks.live.as_ref()?;
+        if !task.import {
+            return None;
+        }
+        ranges
+            .iter()
+            .copied()
+            .find(|range| overlapping(&task.slots, &[*range]))
+    }
+
     /// Cancel the live task if it is the one named, and say whether it was.
     ///
     /// `None` means every task, which is what `CANCEL ALL` sends. A finished
@@ -514,8 +574,13 @@ impl Asm {
             task.state = State::SendStream;
             // The snapshot has been read by the time this runs and there is no
             // moment at which it is half sent, so the connection it goes down is
-            // done with as far as anything that reads this is concerned.
+            // done with as far as anything that reads this is concerned. It is
+            // let go of here as well as marked done, because the far side closes
+            // it the moment the last of the snapshot has landed and a connection
+            // the task still knew about would make that read as the snapshot
+            // channel dropping under a live migration.
             task.rdb_state = State::Completed;
+            task.rdb = None;
             self.streaming.store(true, Relaxed);
         }
     }
@@ -862,6 +927,133 @@ impl Server {
         Ok(())
     }
 
+    /// Start a migration onto this node, which is `CLUSTER MIGRATION IMPORT`.
+    ///
+    /// The id is made here rather than agreed, because the node taking the slots
+    /// is the one that names the move: it is what goes out in the `SYNC`, what
+    /// the source records against its own task, and what an operator watching
+    /// from either end lines the two up by.
+    ///
+    /// Nothing is dialled here. The task is left at `none` and the thread that
+    /// drives it is started by the caller, which is what lets the command answer
+    /// the id straight away the way the reference does.
+    pub(super) fn asm_begin_import(
+        &self,
+        source: Vec<u8>,
+        slots: Vec<(u16, u16)>,
+    ) -> Result<String> {
+        let now = self.now_ms() as i64;
+        let dest = self.cluster.map.lock().nodes[0].id.clone();
+        let mut tasks = self.cluster.asm.inner.lock();
+        if let Some(live) = tasks.live.as_mut() {
+            // A move that failed is not a reason to refuse the next one, and
+            // asking for one is how an operator retries. Anything still running
+            // is, because one at a time is the rule.
+            if live.state != State::Failed {
+                return Err(Error::new(
+                    Code::Invalid,
+                    "another ASM task is already in progress",
+                ));
+            }
+            live.blame("Cancelled due to new import requested");
+            live.state = State::Canceled;
+            self.cluster.asm.retire(&mut tasks, now);
+        }
+        let id = yo_alloc::allow(|| String::from_utf8_lossy(&super::new_id()).into_owned());
+        tasks.live = Some(Task {
+            id: id.clone(),
+            slots,
+            source,
+            dest: dest.into_bytes(),
+            import: true,
+            state: State::None,
+            error: String::new(),
+            retries: 0,
+            created: now,
+            started: -1,
+            ended: -1,
+            main: None,
+            rdb: None,
+            sent: 0,
+            acked: 0,
+            dest_state: State::None,
+            paused: 0,
+            rdb_state: State::None,
+        });
+        Ok(id)
+    }
+
+    /// Move an import task along, and say whether it is still the live one.
+    ///
+    /// False is the thread's cue to stop and to say nothing more about the task,
+    /// because something else has already ended it: an operator cancelling, or a
+    /// second move being asked for. Every step of the import goes through here so
+    /// that a cancel lands within one step rather than whenever the socket next
+    /// does something.
+    pub(super) fn asm_import_at(&self, id: &[u8], state: State, rdb: Option<State>) -> bool {
+        let mut tasks = self.cluster.asm.inner.lock();
+        let Some(task) = tasks.live.as_mut() else {
+            return false;
+        };
+        if !task.import || task.id.as_bytes() != id {
+            return false;
+        }
+        if task.started < 0 {
+            task.started = self.now_ms() as i64;
+        }
+        task.state = state;
+        if let Some(rdb) = rdb {
+            task.rdb_state = rdb;
+        }
+        true
+    }
+
+    /// Count bytes of the change stream this node has worked through, and answer
+    /// with the total so far.
+    ///
+    /// The same bytes the source counted as it sent them, which is what makes the
+    /// two numbers comparable at all: the source stops taking writes when what it
+    /// has been told matches what it has sent, so a destination counting anything
+    /// else would be answering a different question.
+    pub(super) fn asm_import_applied(&self, id: &[u8], n: u64) -> Option<u64> {
+        let mut tasks = self.cluster.asm.inner.lock();
+        let task = tasks.live.as_mut()?;
+        if !task.import || task.id.as_bytes() != id {
+            return None;
+        }
+        task.acked += n;
+        Some(task.acked)
+    }
+
+    /// Give up on an import, in the reference's sentence.
+    pub(super) fn asm_import_failed(&self, id: &[u8], why: &str) {
+        let now = self.now_ms() as i64;
+        let mut tasks = self.cluster.asm.inner.lock();
+        let Some(task) = tasks.live.as_mut() else {
+            return;
+        };
+        if !task.import || task.id.as_bytes() != id {
+            return;
+        }
+        task.blame(why);
+        task.state = State::Failed;
+        self.cluster.asm.retire(&mut tasks, now);
+    }
+
+    /// The import is over and the slots are this node's. Retire the task.
+    pub(super) fn asm_import_done(&self, id: &[u8]) {
+        let now = self.now_ms() as i64;
+        let mut tasks = self.cluster.asm.inner.lock();
+        let Some(task) = tasks.live.as_mut() else {
+            return;
+        };
+        if !task.import || task.id.as_bytes() != id {
+            return;
+        }
+        task.state = State::Completed;
+        self.cluster.asm.retire(&mut tasks, now);
+    }
+
     /// Take the second connection of a migration, which is
     /// `CLUSTER SYNCSLOTS RDBCHANNEL`.
     ///
@@ -1118,6 +1310,21 @@ impl Server {
             Moved::Elsewhere if !demoted => self.trim_slots(&moved, Trim::Keys),
             Moved::Elsewhere => {}
         }
+    }
+
+    /// Empty out the slots a move is about to fill, which is the reference's
+    /// `asmTrimSlotsIfNotOwned`.
+    ///
+    /// Only the ones this node does not own, which is all of them at the start of
+    /// an import and none of them if the same range came back some other way in
+    /// between. What they hold is whatever a move that failed left behind, and
+    /// filling on top of it would leave a slot holding two datasets at once.
+    ///
+    /// A deletion per key rather than one `TRIMSLOTS`, because this is not a
+    /// migration finishing and there is no range anybody downstream could work
+    /// the keys out from: the slots are not this node's yet.
+    pub(super) fn asm_import_trim(&self, ranges: &[(u16, u16)]) {
+        self.trim_slots(ranges, Trim::Keys);
     }
 
     /// Drop the keys of the slots a `TRIMSLOTS` names.
@@ -1925,5 +2132,206 @@ mod tests {
         // Newest first, which is the order the reference keeps them in.
         let newest = format!("{:040}", KEEP + 4);
         assert!(got.contains(&newest), "{got:?}");
+    }
+
+    /// The taking side books the task before it dials anything, so a status
+    /// asked for in the moment between the reply and the first byte on the wire
+    /// still finds it.
+    #[test]
+    fn an_import_is_booked_before_anything_is_dialled() {
+        let server = node();
+        let id = server
+            .asm_begin_import(vec![b'b'; 40], vec![(0, 100), (500, 600)])
+            .expect("nothing else is running");
+        assert_eq!(id.len(), 40, "{id:?}");
+        let mut out = Out::new(Proto::Resp3);
+        server.cluster.asm.report_all(&mut out);
+        let got = text(&out);
+        assert!(got.contains("$6\r\nimport\r\n"), "{got:?}");
+        assert!(got.contains("$4\r\nnone\r\n"), "{got:?}");
+        assert!(got.contains("$13\r\n0-100 500-600\r\n"), "{got:?}");
+        // The source is the node the slots are coming from and the destination
+        // is this one, which is the way round the migrate side is not.
+        assert!(got.contains(&"b".repeat(40)), "{got:?}");
+        assert!(got.contains(&server.cluster_id()), "{got:?}");
+    }
+
+    /// One task at a time, whichever way it is going. The words differ from the
+    /// migrate side's by a capital letter and that is the reference's doing.
+    #[test]
+    fn a_second_import_waits_for_the_first() {
+        let server = node();
+        server
+            .asm_begin_import(vec![b'b'; 40], vec![(0, 100)])
+            .expect("nothing else is running");
+        let err = server
+            .asm_begin_import(vec![b'b'; 40], vec![(200, 300)])
+            .expect_err("one is already going");
+        assert!(
+            err.to_string()
+                .ends_with("another ASM task is already in progress"),
+            "{err}"
+        );
+        // And a migration out of this node is in the way of an import into it
+        // just the same, because there is only ever the one task.
+        let server = node();
+        server
+            .asm_begin_migrate(&[b'b'; 40], &[b'c'; 40], vec![(0, 100)], &wire(7))
+            .expect("nothing else is running");
+        let err = server
+            .asm_begin_import(vec![b'b'; 40], vec![(0, 100)])
+            .expect_err("one is already going");
+        assert!(
+            err.to_string().contains("another ASM task is already"),
+            "{err}"
+        );
+    }
+
+    /// A task that has already failed is not in the way of a new one, and the
+    /// reason it went is still there to read afterwards.
+    ///
+    /// The reference leaves a failed task as the current one and cancels it when
+    /// the next import turns up, which overwrites why it failed with "Cancelled
+    /// due to new import requested". Here it is retired the moment it fails and
+    /// keeps its own reason, which is D-155.
+    #[test]
+    fn a_failed_task_makes_way_for_a_new_import() {
+        let server = node();
+        let first = server
+            .asm_begin_import(vec![b'b'; 40], vec![(0, 100)])
+            .expect("nothing else is running");
+        server.asm_import_failed(first.as_bytes(), "the source hung up");
+        let second = server
+            .asm_begin_import(vec![b'c'; 40], vec![(0, 100)])
+            .expect("the failed one is not in the way");
+        assert_ne!(first, second);
+        let mut out = Out::new(Proto::Resp3);
+        server.cluster.asm.report_all(&mut out);
+        let got = text(&out);
+        assert!(got.contains("the source hung up"), "{got:?}");
+        assert!(got.contains("$6\r\nfailed\r\n"), "{got:?}");
+    }
+
+    /// Two imports of the same slots are refused by naming the slots, which is
+    /// the more useful sentence than one task at a time when the caller is a
+    /// resharding tool working through a range.
+    #[test]
+    fn an_overlapping_import_is_named_by_its_slots() {
+        let server = node();
+        assert_eq!(server.cluster.asm.overlapping_import(&[(0, 100)]), None);
+        server
+            .asm_begin_import(vec![b'b'; 40], vec![(100, 200), (900, 950)])
+            .expect("nothing else is running");
+        assert_eq!(
+            server.cluster.asm.overlapping_import(&[(50, 150)]),
+            Some((50, 150))
+        );
+        assert_eq!(
+            server
+                .cluster
+                .asm
+                .overlapping_import(&[(0, 50), (940, 960)]),
+            Some((940, 960)),
+            "the first range that touches, not the first range asked about"
+        );
+        assert_eq!(
+            server
+                .cluster
+                .asm
+                .overlapping_import(&[(0, 99), (201, 300)]),
+            None
+        );
+        // A migration going the other way over the same slots is not an overlap.
+        // It is refused, but as one task at a time.
+        let server = node();
+        server
+            .asm_begin_migrate(&[b'b'; 40], &[b'c'; 40], vec![(100, 200)], &wire(7))
+            .expect("nothing else is running");
+        assert_eq!(server.cluster.asm.overlapping_import(&[(100, 200)]), None);
+    }
+
+    /// How far the taking side has got is counted on the task, because that is
+    /// the number it sends back and the source stops writes on.
+    #[test]
+    fn an_import_counts_what_it_has_applied() {
+        let server = node();
+        let id = server
+            .asm_begin_import(vec![b'b'; 40], vec![(0, 100)])
+            .expect("nothing else is running");
+        assert_eq!(server.asm_import_applied(id.as_bytes(), 40), Some(40));
+        assert_eq!(server.asm_import_applied(id.as_bytes(), 2), Some(42));
+        // Nothing at all still answers, because the reading side asks for the
+        // running total every time it is about to acknowledge.
+        assert_eq!(server.asm_import_applied(id.as_bytes(), 0), Some(42));
+        // And a task that is not this one is not counted against.
+        assert_eq!(server.asm_import_applied(&[b'z'; 40], 5), None);
+        assert!(server.asm_import_at(id.as_bytes(), State::AccumulateBuf, None));
+        assert!(!server.asm_import_at(&[b'z'; 40], State::Takeover, None));
+        let mut out = Out::new(Proto::Resp3);
+        server.cluster.asm.report_one(id.as_bytes(), &mut out);
+        assert!(text(&out).contains("accumulate-buffer"), "{:?}", text(&out));
+        server.asm_import_done(id.as_bytes());
+        let mut out = Out::new(Proto::Resp3);
+        server.cluster.asm.report_one(id.as_bytes(), &mut out);
+        assert!(text(&out).contains("completed"), "{:?}", text(&out));
+    }
+
+    /// The far side closes the snapshot connection the moment the last of the
+    /// snapshot lands, which is normal and must not read as a channel dropping
+    /// under a live migration.
+    #[test]
+    fn the_snapshot_connection_closing_after_it_is_read_is_not_a_failure() {
+        let server = node();
+        let id = [b'b'; 40];
+        server
+            .asm_begin_migrate(&id, &[b'c'; 40], vec![(0, 16383)], &wire(7))
+            .expect("nothing else is running");
+        server
+            .asm_take_rdb_channel(&id, 8)
+            .expect("the task is waiting for it");
+        server.asm_snapshot(&[(0, 16383)]);
+        server.asm_forget(8);
+        let mut out = Out::new(Proto::Resp3);
+        server.cluster.asm.report_one(&id, &mut out);
+        let got = text(&out);
+        assert!(got.contains("send-stream"), "{got:?}");
+        assert!(!got.contains("failed"), "{got:?}");
+        // The main channel going is still the end of it.
+        server.asm_forget(7);
+        let mut out = Out::new(Proto::Resp3);
+        server.cluster.asm.report_one(&id, &mut out);
+        let got = text(&out);
+        assert!(got.contains("failed"), "{got:?}");
+        assert!(
+            got.contains("Main channel - Connection with the peer node was lost"),
+            "{got:?}"
+        );
+    }
+
+    /// Every state has the reference's word for it, because the taking side
+    /// sends its state back on each acknowledgement and the source matches on
+    /// the text.
+    #[test]
+    fn the_import_states_read_the_way_the_reference_writes_them() {
+        let words = [
+            (State::Connecting, "connecting"),
+            (State::AuthReply, "auth-reply"),
+            (State::SendHandshake, "send-handshake"),
+            (State::HandshakeReply, "handshake-reply"),
+            (State::SendSyncslots, "send-syncslots"),
+            (State::SyncslotsReply, "syncslots-reply"),
+            (State::InitRdbchannel, "init-rdbchannel"),
+            (State::AccumulateBuf, "accumulate-buffer"),
+            (State::ReadyToStream, "ready-to-stream"),
+            (State::StreamingBuf, "streaming-buffer"),
+            (State::WaitStreamEof, "wait-stream-eof"),
+            (State::Takeover, "takeover"),
+            (State::RdbchannelRequest, "rdbchannel-request"),
+            (State::RdbchannelReply, "rdbchannel-reply"),
+            (State::RdbchannelTransfer, "rdbchannel-transfer"),
+        ];
+        for (state, want) in words {
+            assert_eq!(state.word(), want);
+        }
     }
 }

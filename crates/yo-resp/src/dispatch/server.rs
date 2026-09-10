@@ -842,6 +842,13 @@ fn command(args: Args<'_>, out: &mut Out) -> Result<()> {
     }
     let sub = args.get(1);
     if is(sub, b"COUNT") {
+        // Nothing to say about, so anything after it is the caller meaning
+        // something else. The reference gives these two an exact arity where the
+        // rest of the container takes a list, and being loose here would let a
+        // client's typo answer as though it had asked the question it meant to.
+        if args.len() != 2 {
+            return Err(args::wrong_arity_sub("command", "count"));
+        }
         out.int(table::COMMANDS.len() as i64);
     } else if is(sub, b"INFO") {
         if args.len() == 2 {
@@ -872,6 +879,9 @@ fn command(args: Args<'_>, out: &mut Out) -> Result<()> {
     } else if is(sub, b"GETKEYSANDFLAGS") {
         getkeys(args, out, true)?;
     } else if is(sub, b"HELP") {
+        if args.len() != 2 {
+            return Err(args::wrong_arity_sub("command", "help"));
+        }
         help(out, COMMAND_HELP);
     } else {
         return Err(args::unknown_subcommand(sub, "COMMAND"));

@@ -59,6 +59,7 @@ use super::{Server, Session};
 
 mod asm;
 mod bus;
+mod import;
 use super::keyspec;
 use super::table::Spec;
 pub(super) use asm::Migration;
@@ -959,18 +960,6 @@ pub(super) fn disabled() -> Error {
     Error::new(Code::Invalid, "This instance has cluster support disabled")
 }
 
-/// What atomic slot migration answers until it is in, which is D-149.
-///
-/// The sentence names the other way of moving a slot because there is one and it
-/// works, so an operator who reads this is one command away from getting on with
-/// it rather than stuck.
-fn not_yet(what: &str) -> Error {
-    Error::fmt(
-        Code::Invalid,
-        format_args!("{what} is not implemented yet, move the slot with SETSLOT and MIGRATE"),
-    )
-}
-
 /// The reference's sentence for a node id nobody has heard of.
 fn unknown_node(id: &[u8]) -> Error {
     Error::fmt(
@@ -1737,19 +1726,85 @@ fn migration(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         return Err(Error::new(Code::Invalid, "unknown argument"));
     }
     let ranges = slot_ranges(&args, 3)?;
+    let (source, host, port) = import_source(server, &ranges)?;
+    // An embedded server has no bus, nobody to dial and nobody to tell, so there
+    // is nothing an import could even mean on one. Checked after the slot ranges
+    // rather than before, so that a caller who got the ranges wrong is told about
+    // the ranges wherever the command was sent.
+    let Some(shared) = server.myself() else {
+        return Err(Error::new(
+            Code::Invalid,
+            "slot migration needs a server with a cluster bus",
+        ));
+    };
+    let id = server.asm_begin_import(source, ranges.clone())?;
+    out.bulk(id.as_bytes());
+    import::start(
+        &shared,
+        import::Job {
+            id,
+            host,
+            port,
+            slots: ranges,
+        },
+    );
+    Ok(())
+}
+
+/// Who a set of slot ranges would have to come from, which is the reference's
+/// `validateImportSlotRanges` and the owner check behind it.
+///
+/// In the reference's order, because the order is what a caller reads to find
+/// out which of several things it got wrong. The last of them is the one an
+/// operator hits most: asking a node to import slots it already has.
+fn import_source(server: &Server, ranges: &[(u16, u16)]) -> Result<(Vec<u8>, String, u16)> {
     let map = server.cluster.map.lock();
-    if ranges
-        .iter()
-        .flat_map(|(from, to)| *from..=*to)
-        .all(|slot| map.mine(slot))
-    {
+    if !map.nodes[0].is_master() {
+        return Err(Error::new(
+            Code::Invalid,
+            "slot migration not allowed on replica.",
+        ));
+    }
+    // The two ways of moving a slot do not mix, the same as on the giving up
+    // side: a slot half way through the old one has keys on two nodes at once.
+    if (0..SLOTS).any(|at| map.migrating[at].is_some() || map.importing[at].is_some()) {
+        return Err(Error::new(
+            Code::Invalid,
+            "all slot states must be STABLE to start a slot migration task.",
+        ));
+    }
+    if let Some((from, to)) = server.cluster.asm.overlapping_import(ranges) {
+        return Err(Error::fmt(
+            Code::Invalid,
+            format_args!("overlapping import exists for slot range: {from}-{to}"),
+        ));
+    }
+    let mut owner = None;
+    for &(from, to) in ranges {
+        for slot in from..=to {
+            let Some(at) = map.owner[usize::from(slot)] else {
+                return Err(Error::fmt(
+                    Code::Invalid,
+                    format_args!("slot has no owner: {slot}"),
+                ));
+            };
+            if *owner.get_or_insert(at) != at {
+                return Err(Error::new(
+                    Code::Invalid,
+                    "slots belong to different source nodes",
+                ));
+            }
+        }
+    }
+    let at = owner.unwrap_or(0);
+    if at == 0 {
         return Err(Error::new(
             Code::Invalid,
             "this node is already the owner of the slot range",
         ));
     }
-    drop(map);
-    Err(not_yet("CLUSTER MIGRATION IMPORT"))
+    let node = &map.nodes[usize::from(at)];
+    Ok((node.id.as_bytes().to_vec(), node.host.clone(), node.port))
 }
 
 /// The list of slot ranges the tail of an argument list spells out, which is the
@@ -2310,6 +2365,35 @@ fn bump_without_consensus(server: &Server, map: &mut Map) -> bool {
     }
     map.nodes[0].epoch = server.cluster.epoch.fetch_add(1, Relaxed) + 1;
     true
+}
+
+/// Claim slot ranges for this node, which is the last step of an import and the
+/// reference's `ASM_EVENT_TAKEOVER`.
+///
+/// Nobody is asked. The epoch goes up without consensus and the claim goes out
+/// on the bus, and a higher epoch is the whole of how every other node decides
+/// which of two claims on a slot is the newer one. That is safe here for the
+/// reason it is not safe in general: the node that used to own these slots has
+/// stopped taking writes for them and has said there is nothing more coming, so
+/// there is no second writer to disagree with.
+///
+/// The old owner finds out the same way everybody else does, from the bus, and
+/// what it does about it is the other half of this, in `asm_slots_moved`.
+fn take_slots(server: &Server, ranges: &[(u16, u16)]) -> Result<()> {
+    {
+        let mut map = server.cluster.map.lock();
+        for slot in ranges.iter().flat_map(|(from, to)| *from..=*to) {
+            let at = usize::from(slot);
+            map.owner[at] = Some(0);
+            map.importing[at] = None;
+            map.migrating[at] = None;
+        }
+        bump_without_consensus(server, &mut map);
+    }
+    server.recount_coverage();
+    save(server)?;
+    server.cluster_broadcast_pong();
+    Ok(())
 }
 
 /// `CLUSTER FLUSHSLOTS`, which drops every slot this node claims.
