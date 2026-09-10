@@ -24,13 +24,15 @@
 //! arrives with `CLUSTER SYNCSLOTS RDBCHANNEL`, and then every write that lands
 //! in the moving slots goes down the first connection behind it until the far
 //! side says it has caught up. Then writes stop, what was already running is
-//! waited out, and the far side is told the stream has ended.
+//! waited out, and the far side is told the stream has ended. It claims the
+//! slots over the bus, this node hears the claim, the task is finished, the
+//! writes go again and the keys that have moved are dropped.
 //!
-//! What is not here is the last step of all, which is the far side claiming the
-//! slots over the bus and this node dropping the keys it no longer owns. Until
-//! that is written a migration against this node stops at `stream-eof` and gives
-//! up when the write pause runs out, so the slots stay here and nothing is lost.
-//! That is D-149 and it is the next piece.
+//! What is not here is the other side of it: `CLUSTER MIGRATION IMPORT`, which
+//! is a node asking to take slots rather than being asked to give them up. Every
+//! move against this node is therefore one the far side drives, which is what a
+//! real cluster does anyway, since the node taking the slots is the one that
+//! starts a move. That is what is left of D-149.
 //!
 //! # Where the two streams meet
 //!
@@ -372,9 +374,7 @@ impl Task {
         // a migration that got all the way through. One that is still running or
         // that gave up says nought however long it held the server, because the
         // number is there to be read after the fact and a running one has no
-        // total yet. Nothing reaches `completed` until the slots can change
-        // hands, so today this is always nought and the rule is here rather than
-        // the number.
+        // total yet.
         out.bulk(b"write_pause_ms");
         out.int(if self.import || self.state != State::Completed {
             0
@@ -669,6 +669,112 @@ impl Asm {
         let tasks = self.inner.lock();
         tasks.live.as_ref().is_some_and(|task| task.state.pausing())
     }
+
+    /// The slots have changed hands. Say what that did to the task moving them.
+    ///
+    /// The task has to be moving exactly these slots and no others, which is the
+    /// reference's rule and is stricter than it looks: a claim that covers half
+    /// of what a migration is moving is not that migration finishing, it is
+    /// something else happening to the cluster while a migration was running,
+    /// and the migration is given up on rather than reported as done.
+    fn config_updated(&self, moved: &[(u16, u16)], now: i64) -> Moved {
+        let mut tasks = self.inner.lock();
+        let Some(task) = tasks.live.as_mut() else {
+            return Moved::Elsewhere;
+        };
+        if task.slots == moved {
+            if !task.import && task.state == State::StreamEof {
+                // The one path a migration finishes down. The error is cleared
+                // rather than left, because a task that was retried carries the
+                // reason the earlier try stopped and the one that got through
+                // did not stop for anything.
+                task.error.clear();
+                task.state = State::Completed;
+                let slots = yo_alloc::allow(|| task.slots.clone());
+                self.retire(&mut tasks, now);
+                return Moved::Done(slots);
+            }
+            task.blame("Cancelled due to slots configuration updated");
+            task.state = State::Canceled;
+            self.retire(&mut tasks, now);
+            return Moved::Cancelled;
+        }
+        if overlapping(&task.slots, moved) {
+            task.blame("Cancelled due to slots configuration updated");
+            task.state = State::Canceled;
+            self.retire(&mut tasks, now);
+        }
+        Moved::Elsewhere
+    }
+}
+
+/// What a slot changing hands did to the migration that was moving it.
+///
+/// It decides two things the caller has to get right: whether the keys behind
+/// those slots are dropped, and how the drop is told to anybody following this
+/// node.
+enum Moved {
+    /// This was a migration finishing, and these are the slots it moved.
+    Done(Vec<(u16, u16)>),
+    /// A migration was moving these and was not ready for them to go, so it was
+    /// given up on. Nothing is dropped: the slots were the task's to move and a
+    /// task that was cancelled is not a reason to lose keys.
+    Cancelled,
+    /// No migration was moving them, so they went some other way, which is a
+    /// failover or an operator with `CLUSTER SETSLOT`. Whatever this node still
+    /// holds for them belongs to somebody else now.
+    Elsewhere,
+}
+
+/// How the keys a trim drops are told to anybody following this node.
+///
+/// The three are not a choice, they are three different situations. What varies
+/// is whether the deletions are already accounted for by something else on the
+/// stream, and whether anybody asked for these keys to go.
+#[derive(Clone, Copy)]
+enum Trim {
+    /// One `TRIMSLOTS` naming the ranges, and a `del` event per key. What a
+    /// migration finishing does: an operator asked for this and is watching, and
+    /// a replica can work the key list out from the ranges.
+    Ranges,
+    /// A deletion per key and no events. What a slot that went some other way
+    /// does, which is a failover or an operator moving it by hand. Nobody asked
+    /// for these keys to go, so a client listening to the keyspace is not told
+    /// they did, and there is no command on the stream to carry them.
+    Keys,
+    /// Neither, because the command that asked for the trim is itself on the
+    /// stream. What `TRIMSLOTS` arriving from a master does. The events still
+    /// fire, since the far side of a migration is where the operator is looking.
+    Already,
+}
+
+/// Whether two sorted range lists have a slot in common.
+fn overlapping(a: &[(u16, u16)], b: &[(u16, u16)]) -> bool {
+    a.iter()
+        .any(|(from, to)| b.iter().any(|(start, end)| from <= end && start <= to))
+}
+
+/// A list of slots as the ranges the reference would write, sorted and with the
+/// ones that touch joined up.
+fn joined(slots: &[u16]) -> Vec<(u16, u16)> {
+    let mut sorted = yo_alloc::allow(|| slots.to_vec());
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut ranges: Vec<(u16, u16)> = Vec::new();
+    yo_alloc::allow(|| {
+        for slot in sorted {
+            match ranges.last_mut() {
+                Some(last) if u32::from(last.1) + 1 == u32::from(slot) => last.1 = slot,
+                _ => ranges.push((slot, slot)),
+            }
+        }
+    });
+    ranges
+}
+
+/// Whether a slot is in one of the ranges.
+fn within(ranges: &[(u16, u16)], slot: u16) -> bool {
+    ranges.iter().any(|(from, to)| *from <= slot && slot <= *to)
 }
 
 impl Server {
@@ -980,6 +1086,111 @@ impl Server {
         }
         self.cluster.asm.armed.store(0, Relaxed);
         self.lift(armed, false);
+    }
+
+    /// Slots this node was serving have moved to somebody else.
+    ///
+    /// Called from the bus once a claim carrying a higher epoch has been
+    /// believed and the map has been written, which is the moment a migration
+    /// has been waiting for: the far side owns the slots and every other node is
+    /// being told. What is left is to let the writes go and to drop the keys,
+    /// because a node answering for a key in a slot it does not own is two nodes
+    /// answering for the same data.
+    ///
+    /// `demoted` is a node that gave away its last slot and is now following the
+    /// node that took them. It keeps its keys. It is about to be sent the whole
+    /// dataset by its new master and throwing them away first would only mean
+    /// copying them straight back.
+    pub(crate) fn asm_slots_moved(&self, lost: &[u16], demoted: bool) {
+        if lost.is_empty() {
+            return;
+        }
+        let moved = joined(lost);
+        let now = self.now_ms() as i64;
+        let outcome = self.cluster.asm.config_updated(&moved, now);
+        // First of all, whatever happened. A handoff that got this far is over
+        // one way or the other and the writes it stopped have waited long
+        // enough.
+        self.asm_relax();
+        match outcome {
+            Moved::Done(slots) => self.trim_slots(&slots, Trim::Ranges),
+            Moved::Cancelled => {}
+            Moved::Elsewhere if !demoted => self.trim_slots(&moved, Trim::Keys),
+            Moved::Elsewhere => {}
+        }
+    }
+
+    /// Drop the keys of the slots a `TRIMSLOTS` names.
+    ///
+    /// The command has already been checked and is propagated by the dispatcher
+    /// like any other write, so there is nothing to announce here.
+    pub(super) fn trim_named_slots(&self, ranges: &[(u16, u16)]) {
+        self.trim_slots(ranges, Trim::Already);
+    }
+
+    /// Drop the keys of slots this node does not serve any more.
+    fn trim_slots(&self, ranges: &[(u16, u16)], how: Trim) {
+        // Only the slots that really are somebody else's. A range that came back
+        // to this node between the claim and here is not one to empty out, and a
+        // slot with nothing in it is not worth naming either.
+        let ranges = {
+            let map = self.cluster.map.lock();
+            let mine: Vec<u16> = yo_alloc::allow(|| {
+                ranges
+                    .iter()
+                    .flat_map(|&(from, to)| from..=to)
+                    .filter(|slot| map.owner[usize::from(*slot)] != Some(0))
+                    .collect()
+            });
+            joined(&mine)
+        };
+        if ranges.is_empty() {
+            return;
+        }
+        let armed = super::super::notify::arm(self, 0);
+        for at in 0..self.dbs.len() {
+            // Collected before anything is taken, because the walk holds one
+            // stripe at a time while it reads and taking a key holds the stripe
+            // that key is on, which is the same lock as often as not.
+            let mut doomed: Vec<Vec<u8>> = Vec::new();
+            self.dbs[at].keys(|key| {
+                if within(&ranges, key_slot(key)) {
+                    yo_alloc::allow(|| doomed.push(key.to_vec()));
+                }
+            });
+            for key in &doomed {
+                if !self.dbs[at].hold(key).del(key) {
+                    continue;
+                }
+                match how {
+                    Trim::Keys if self.propagating() => {
+                        super::super::repl::announce(self, at, &[b"DEL", key]);
+                    }
+                    Trim::Keys => {}
+                    Trim::Ranges | Trim::Already => super::super::notify::fire(
+                        at,
+                        super::super::notify::class::GENERIC,
+                        "del",
+                        key,
+                    ),
+                }
+            }
+        }
+        if matches!(how, Trim::Ranges) && self.propagating() {
+            let mut parts: Vec<Vec<u8>> = Vec::new();
+            yo_alloc::allow(|| {
+                parts.push(b"TRIMSLOTS".to_vec());
+                parts.push(b"RANGES".to_vec());
+                parts.push(ranges.len().to_string().into_bytes());
+                for (from, to) in &ranges {
+                    parts.push(from.to_string().into_bytes());
+                    parts.push(to.to_string().into_bytes());
+                }
+                let wire: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+                super::super::repl::announce(self, 0, &wire);
+            });
+        }
+        super::super::notify::drain(self, armed);
     }
 
     /// Read one of the `cluster-slot-migration-*` settings.
@@ -1490,6 +1701,106 @@ mod tests {
         );
         server.asm_relax();
         assert_eq!(server.paused(server.now_ms()), None);
+    }
+
+    /// Play a migration of one slot range as far as `stream-eof`, which is the
+    /// point every test below this one starts from.
+    fn handed_over(server: &Server, id: &[u8], slots: Vec<(u16, u16)>) {
+        server
+            .asm_begin_migrate(id, &[b'c'; 40], slots.clone(), &wire(7))
+            .expect("nothing else is running");
+        server
+            .asm_take_rdb_channel(id, 8)
+            .expect("the task is waiting for it");
+        server.asm_snapshot(&slots);
+        server.asm_ack(7, b"wait-stream-eof", 0);
+    }
+
+    /// The far side claiming the slots is the end of the migration: the task is
+    /// done, the writes go again, and the keys that moved are dropped.
+    #[test]
+    fn the_slots_changing_hands_finishes_the_migration() {
+        let server = node();
+        let id = [b'b'; 40];
+        let foo = key_slot(b"foo");
+        let bar = key_slot(b"bar");
+        assert_ne!(foo, bar);
+        set(&server, b"foo", b"moved", None);
+        set(&server, b"bar", b"stayed", None);
+        handed_over(&server, &id, vec![(foo, foo)]);
+        assert_eq!(server.paused(server.now_ms()), Some(false));
+
+        server.asm_slots_moved(&[foo], false);
+        assert_eq!(server.paused(server.now_ms()), None, "the writes go again");
+        assert!(server.cluster.asm.inner.lock().live.is_none());
+        let mut out = Out::new(Proto::Resp3);
+        server.cluster.asm.report_one(&id, &mut out);
+        let got = text(&out);
+        assert!(got.contains("$9\r\ncompleted\r\n"), "{got:?}");
+        // A task that got through says nothing went wrong, even if an earlier
+        // try did.
+        assert!(got.contains("last_error\r\n$0\r\n\r\n"), "{got:?}");
+        // And the keys of the slot that moved are gone, while the rest are not.
+        assert!(!server.dbs[0].hold(b"foo").exists(b"foo"));
+        assert!(server.dbs[0].hold(b"bar").exists(b"bar"));
+    }
+
+    /// A claim that does not name exactly what a migration was moving is not
+    /// that migration finishing, so the migration is given up on.
+    #[test]
+    fn a_claim_for_the_wrong_slots_ends_the_migration() {
+        let server = node();
+        let id = [b'b'; 40];
+        handed_over(&server, &id, vec![(100, 200)]);
+        // Half of what it was moving, which is something else happening to the
+        // cluster and not this move getting there.
+        server.asm_slots_moved(&[150], false);
+        assert_eq!(server.paused(server.now_ms()), None);
+        let mut out = Out::new(Proto::Resp3);
+        server.cluster.asm.report_one(&id, &mut out);
+        let got = text(&out);
+        assert!(
+            got.contains(
+                "Cancelled due to slots configuration updated (state: stream-eof, rdb_channel_state: completed)"
+            ),
+            "{got:?}"
+        );
+    }
+
+    /// A slot going somewhere else while a migration is running is nothing to do
+    /// with that migration, and leaves it alone.
+    #[test]
+    fn a_claim_somewhere_else_leaves_the_migration_alone() {
+        let server = node();
+        let id = [b'b'; 40];
+        handed_over(&server, &id, vec![(100, 200)]);
+        server.asm_slots_moved(&[300], false);
+        let state = server.cluster.asm.inner.lock().live.as_ref().unwrap().state;
+        assert_eq!(state, State::StreamEof);
+    }
+
+    /// A slot that moved with no migration behind it still takes its keys with
+    /// it, because two nodes answering for the same key is the one thing that
+    /// must not happen.
+    #[test]
+    fn slots_that_moved_on_their_own_drop_their_keys() {
+        let server = node();
+        let foo = key_slot(b"foo");
+        set(&server, b"foo", b"gone", None);
+        server.asm_slots_moved(&[foo], false);
+        assert!(!server.dbs[0].hold(b"foo").exists(b"foo"));
+    }
+
+    /// Except on a node that gave away its last slot. It is following whoever
+    /// took them now and is about to be sent the whole dataset, so throwing the
+    /// keys away first would only mean copying them straight back.
+    #[test]
+    fn a_node_that_lost_everything_keeps_its_keys() {
+        let server = node();
+        let foo = key_slot(b"foo");
+        set(&server, b"foo", b"kept", None);
+        server.asm_slots_moved(&[foo], true);
+        assert!(server.dbs[0].hold(b"foo").exists(b"foo"));
     }
 
     /// One at a time, because two moves at once would each be pausing writes
